@@ -64,6 +64,14 @@ fi
 
 [[ $STATIC = 1 ]] || STATIC=0
 
+#--- Zstandard, needed to read RVZ images
+
+HAVE_ZSTD=0
+for d in /usr/include /usr/local/include /opt/homebrew/include /opt/local/include
+do
+    [[ -r $d/zstd.h ]] && HAVE_ZSTD=1 && break
+done
+
 #--------------------------------------------------
 
 GCC_VERSION="$( gcc --version | head -n1 | sed 's/([^)]*)//'|awk '{print $2}' )"
@@ -123,6 +131,7 @@ cat <<- __EOT__ >> Makefile.setup
 	FORCE_M32	:= $force_m32
 	HAVE_FUSE	:= $have_fuse
 	HAVE_ZLIB	:= $have_zlib
+	HAVE_ZSTD	:= $HAVE_ZSTD
 	HAVE_MD5	:= $have_md5
 	HAVE_SHA	:= $have_sha
 	STATIC		:= $STATIC

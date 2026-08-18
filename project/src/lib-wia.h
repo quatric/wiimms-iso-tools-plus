@@ -107,6 +107,18 @@
 #define WIA_MAGIC		"WIA\1"
 #define WIA_MAGIC_SIZE		4
 
+// RVZ is a derivative of WIA created by Dolphin.  It shares all structures
+// described here; the differences are Zstandard compression, chunk sizes
+// below 2 MiB, the extended rvz_group_t and the "RVZ packing" of the
+// pseudo random padding data.  See lib-lfg.h and read_rvz_group() in
+// lib-wia.c.  Reading is supported, writing is not.
+
+#define RVZ_MAGIC		"RVZ\1"
+#define RVZ_MAGIC_SIZE		4
+
+// smallest chunk size an RVZ file may use (must also be a power of two)
+#define RVZ_MIN_CHUNK_SIZE	0x8000
+
 //-----------------------------------------------------
 // Format of version number: AABBCCDD = A.BB | A.BB.CC
 // If D != 0x00 && D != 0xff => append: 'beta' D
@@ -275,6 +287,30 @@ typedef struct wia_group_t
 
 } __attribute__ ((packed)) wia_group_t;		// 0x08 = 8 = sizeof(wia_group_t)
 
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////			struct rvz_group_t		///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// RVZ variant of wia_group_t.  The MSB of 'data_size' tells whether the data
+// is compressed with the method named in wia_disc_t (1) or stored with method
+// NONE (0); the remaining 31 bits are the stored size.
+
+typedef struct rvz_group_t
+{
+    // All values are stored in network byte order (big endian)
+
+    u32			data_off4;		// 0x00: file offset/4 of data
+    u32			data_size;		// 0x04: MSB: compressed flag
+						//       31 bits: file size of data
+    u32			rvz_packed_size;	// 0x08: size before RVZ unpacking,
+						//       0: no RVZ packing used
+
+} __attribute__ ((packed)) rvz_group_t;		// 0x0c = 12 = sizeof(rvz_group_t)
+
+#define RVZ_GROUP_COMPRESSED	0x80000000	// MSB of rvz_group_t::data_size
+#define RVZ_GROUP_SIZE_MASK	0x7fffffff	// the remaining size bits
+
 //
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////			struct wia_exception_t		///////////////
@@ -345,6 +381,18 @@ typedef struct wia_controller_t
     wd_memmap_t		memmap;		// memory mapping
 
     bool		encrypt;	// true: encrypt data if reading
+    bool		is_rvz;		// true: source is an RVZ, not a WIA
+
+    //----- RVZ only: an RVZ chunk may be smaller than the 2 MiB unit that
+    //	    the hash recalculation needs, so one internal chunk is assembled
+    //	    from 'rvz_groups_per_chunk' consecutive RVZ groups.
+
+    u32			rvz_chunk_size;		// RVZ chunk size, 0 if not RVZ
+    u32			rvz_groups_per_chunk;	// chunk_size / rvz_chunk_size
+    u32			* rvz_packed_size;	// NULL or n_groups values, host endian
+    u8			* rvz_compressed;	// NULL or n_groups flags
+    u8			* rvz_buf;		// NULL or scratch buffer
+    u32			rvz_buf_size;		// alloced size of 'rvz_buf'
     bool		is_writing;	// false: read a WIA / true: write a WIA
     bool		is_valid;	// true: WIA is valid
 

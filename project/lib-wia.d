@@ -7,4 +7,5 @@ lib-wia.o: src/lib-wia.c dclib/dclib-debug.h dclib/dclib-types.h \
   src/libwbfs/libwbfs_defaults.h src/lib-wia.h src/libwbfs/wiidisc.h \
   src/libwbfs/cert.h src/libwbfs/rijndael.h src/lib-ciso.h \
   src/libwbfs/libwbfs.h src/lib-gcz.h src/patch.h src/dclib-utf8.h \
-  src/match-pattern.h src/lib-bzip2.h src/lib-lzma.h
+  src/match-pattern.h src/lib-bzip2.h src/lib-lzma.h src/lib-lfg.h \
+  /opt/homebrew/include/zstd.h /opt/homebrew/include/zstd_errors.h

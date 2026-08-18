@@ -40,6 +40,11 @@
 #include "iso-interface.h"
 #include "lib-bzip2.h"
 #include "lib-lzma.h"
+#include "lib-lfg.h"
+
+#ifndef NO_ZSTD
+  #include <zstd.h>
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -92,6 +97,9 @@ void ResetWIA
 	FREE(wia->raw_data);
 	FREE(wia->group);
 	FREE(wia->gdata);
+	FREE(wia->rvz_packed_size);
+	FREE(wia->rvz_compressed);
+	FREE(wia->rvz_buf);
 	wd_reset_memmap(&wia->memmap);
 
 	memset(wia,0,sizeof(*wia));
@@ -302,7 +310,8 @@ bool IsWIA
     const wia_file_head_t * fhead = data;
     if ( data_size >= sizeof(wia_file_head_t) )
     {
-	if (!memcmp(fhead->magic,WIA_MAGIC,sizeof(fhead->magic)))
+	if ( !memcmp(fhead->magic,WIA_MAGIC,sizeof(fhead->magic))
+	  || !memcmp(fhead->magic,RVZ_MAGIC,sizeof(fhead->magic)) )
 	{
 	    sha1_hash_t hash;
 	    SHA1( (u8*)fhead, sizeof(*fhead)-sizeof(fhead->file_head_hash), hash );
@@ -343,6 +352,10 @@ bool IsWIA
 //
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////			read helpers			///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+static u8 * alloc_rvz_buf ( wia_controller_t * wia, u32 need );
+
 ///////////////////////////////////////////////////////////////////////////////
 
 static u32 calc_except_size
@@ -581,6 +594,30 @@ static enumError read_data
 
       //----------------------------------------------------------------------
 
+      case WD_COMPR_ZSTD:
+       #ifdef NO_ZSTD
+	return ERROR0(ERR_NOT_IMPLEMENTED,
+	    "No Zstandard support in this build, cannot read RVZ: %s\n",sf->f.fname);
+       #else
+      {
+	// Used for the raw-data and group tables of an RVZ; the group payload
+	// itself goes through read_rvz_group() instead.
+	u8 * in = alloc_rvz_buf(wia,file_data_size);
+	enumError err = ReadAtF(&sf->f,file_offset,in,file_data_size);
+	if (err)
+	    return err;
+
+	const size_t res = ZSTD_decompress(dest,dest_size,in,file_data_size);
+	if (ZSTD_isError(res))
+	    return ERROR0(ERR_WIA_INVALID,
+		"Zstandard error (%s): %s\n",ZSTD_getErrorName(res),sf->f.fname);
+	data_bytes_read = res;
+      }
+      break;
+       #endif
+
+      //----------------------------------------------------------------------
+
       // no default case defined
       //	=> compiler checks the existence of all enum values
 
@@ -612,18 +649,405 @@ static enumError read_data
 
 ///////////////////////////////////////////////////////////////////////////////
 
-static enumError read_gdata
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////			RVZ read support		///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// Make sure the two RVZ scratch buffers are at least 'need' bytes each.
+// 'rvz_buf' is used as [ compressed input | decompressed output ].
+
+static u8 * alloc_rvz_buf ( wia_controller_t * wia, u32 need )
+{
+    DASSERT(wia);
+
+    if ( wia->rvz_buf_size < need )
+    {
+	// grow generously so that a chunk loop does not realloc every group
+	u32 size = wia->rvz_buf_size ? wia->rvz_buf_size : 0x10000;
+	while ( size < need )
+	    size *= 2;
+
+	FREE(wia->rvz_buf);
+	wia->rvz_buf = MALLOC(2*(size_t)size);
+	wia->rvz_buf_size = size;
+    }
+    return wia->rvz_buf;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Decode the RVZ packing of SRC into DEST.  See "RVZ packing" in
+// https://github.com/dolphin-emu/dolphin/blob/master/docs/WiaAndRvz.md
+//
+// DATA_OFFSET is the offset of the group within its wia_raw_data_t or
+// wia_part_t data (hashes excluded, but the modulus is still 32 KiB).
+
+static enumError unpack_rvz
+(
+    SuperFile_t		* sf,		// source file (for error messages only)
+    const u8		* src,		// packed source data
+    u32			src_size,	// size of 'src'
+    u8			* dest,		// destination buffer
+    u32			dest_size,	// exact expected size of the output
+    u64			data_offset	// group offset, needed to seed the PRNG
+)
+{
+    DASSERT(sf);
+    DASSERT(src);
+    DASSERT(dest);
+
+    const u8 * src_end = src + src_size;
+    u8 * dest_ptr = dest;
+    u8 * dest_end = dest + dest_size;
+
+    while ( dest_ptr < dest_end )
+    {
+	if ( src + 4 > src_end )
+	    return ERROR0(ERR_WIA_INVALID,
+		"Truncated RVZ packed data: %s\n",sf->f.fname);
+
+	u32 size = be32(src);
+	src += 4;
+
+	const bool is_junk = ( size & 0x80000000 ) != 0;
+	size &= 0x7fffffff;
+
+	if ( size > dest_end - dest_ptr )
+	    return ERROR0(ERR_WIA_INVALID,
+		"Invalid RVZ packed data size: %s\n",sf->f.fname);
+
+	if (is_junk)
+	{
+	    if ( src + LFG_SEED_SIZE > src_end )
+		return ERROR0(ERR_WIA_INVALID,
+		    "Truncated RVZ junk seed: %s\n",sf->f.fname);
+
+	    lfg_t lfg;
+	    InitializeLFG(&lfg,src);
+	    src += LFG_SEED_SIZE;
+
+	    // Each junk run carries the seed of the 32 KiB block it starts in,
+	    // so the generator has to be advanced to the run's own phase within
+	    // that block.  The phase is taken from the *run's* offset, not the
+	    // group's: a group whose data is not 32 KiB aligned is split by the
+	    // encoder into one run per block, each with its own phase.
+	    ForwardLFG(&lfg,(data_offset+(dest_ptr-dest))%WII_SECTOR_SIZE);
+	    GetBytesLFG(&lfg,dest_ptr,size);
+	}
+	else
+	{
+	    if ( src + size > src_end )
+		return ERROR0(ERR_WIA_INVALID,
+		    "Truncated RVZ raw run: %s\n",sf->f.fname);
+	    memcpy(dest_ptr,src,size);
+	    src += size;
+	}
+	dest_ptr += size;
+    }
+
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Decompress the stored bytes of one RVZ group into 'dest'.
+// Returns the number of bytes written to 'dest'.
+
+static enumError decompress_rvz_data
 (
     SuperFile_t		* sf,		// source file
-    u32			group,		// group index
-    u32			size,		// group size
-    bool		have_except	// true: data contains exception list and
-					// the exception list is stored in tempbuf
+    wd_compression_t	compr,		// compression method to use
+    const u8		* src,		// compressed source
+    u32			src_size,	// size of 'src'
+    u8			* dest,		// destination buffer
+    u32			dest_size,	// size of 'dest'
+    u32			* res_size	// store number of written bytes
+)
+{
+    DASSERT(sf);
+    DASSERT(res_size);
+    *res_size = 0;
+
+    switch (compr)
+    {
+      case WD_COMPR_NONE:
+	if ( src_size > dest_size )
+	    return ERROR0(ERR_WIA_INVALID,
+		"RVZ group too large: %s\n",sf->f.fname);
+	memcpy(dest,src,src_size);
+	*res_size = src_size;
+	return ERR_OK;
+
+      case WD_COMPR_ZSTD:
+       #ifdef NO_ZSTD
+	return ERROR0(ERR_NOT_IMPLEMENTED,
+	    "No Zstandard support in this build, cannot read RVZ: %s\n",sf->f.fname);
+       #else
+	{
+	    const size_t res = ZSTD_decompress(dest,dest_size,src,src_size);
+	    if (ZSTD_isError(res))
+		return ERROR0(ERR_WIA_INVALID,
+		    "Zstandard error (%s): %s\n",
+		    ZSTD_getErrorName(res), sf->f.fname );
+	    *res_size = res;
+	    return ERR_OK;
+	}
+       #endif
+
+      default:
+	return ERROR0(ERR_NOT_IMPLEMENTED,
+	    "RVZ compression method #%u (%s) is not supported: %s\n",
+	    compr, wd_get_compression_name(compr,"unknown"), sf->f.fname );
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Read one RVZ group: decompress it, split off its hash exception list and
+// decode the RVZ packing.  DEST_SIZE is the exact number of payload bytes
+// this group contributes to the chunk.
+
+static enumError read_rvz_group
+(
+    SuperFile_t		* sf,		// source file
+    u32			group,		// absolute group index
+    u8			* dest,		// destination for the payload
+    u32			dest_size,	// number of payload bytes wanted
+    u64			data_offset,	// group offset, needed to seed the PRNG
+    const u8		** except,	// NULL: this group has no exception list
+					// else: store pointer to the list
+    u32			* except_size	// NULL or store size of the list
 )
 {
     DASSERT(sf);
     DASSERT(sf->wia);
     wia_controller_t * wia = sf->wia;
+
+    if ( group >= wia->group_used )
+	return ERROR0(ERR_WIA_INVALID,
+	    "Access to invalid RVZ group %u: %s\n",group,sf->f.fname);
+
+    if (except)
+	*except = 0;
+    if (except_size)
+	*except_size = 0;
+
+    const wia_group_t * grp = wia->group + group;
+    const u32 stored_size = ntohl(grp->data_size);	// MSB already masked off
+
+    if (!stored_size)
+    {
+	// all zero, and no exceptions
+	memset(dest,0,dest_size);
+	return ERR_OK;
+    }
+
+    const u32  packed_size   = wia->rvz_packed_size[group];
+    const bool is_compressed = wia->rvz_compressed[group] != 0;
+
+    // Worst case for the decompressed data: the payload (or its packed form)
+    // plus one full exception list per 2 MiB covered by this group.
+    const u32 n_except_lists = except ? 1 : 0;
+    const u32 max_except = n_except_lists
+		* ( sizeof(wia_except_list_t)
+		  + WII_GROUP_SECTORS * WII_SECTOR_HASH_SIZE / WII_HASH_SIZE
+		    * sizeof(wia_exception_t) );
+    const u32 payload = packed_size ? packed_size : dest_size;
+    const u32 need = ( stored_size > payload ? stored_size : payload ) + max_except + 0x100;
+
+    u8 * in  = alloc_rvz_buf(wia,need);
+    u8 * out = in + wia->rvz_buf_size;
+
+    enumError err = ReadAtF( &sf->f, (u64)ntohl(grp->data_off4)<<2, in, stored_size );
+    if (err)
+	return err;
+
+    u32 out_size;
+    if (is_compressed)
+    {
+	err = decompress_rvz_data( sf, wia->disc.compression,
+				in, stored_size, out, wia->rvz_buf_size, &out_size );
+	if (err)
+	    return err;
+    }
+    else
+    {
+	out = in;
+	out_size = stored_size;
+    }
+
+    // The exception list is stored at the front of the (decompressed) data.
+    // With compression method NONE it is padded to a multiple of 4 bytes.
+    const u8 * data = out;
+    u32 data_size = out_size;
+    if (except)
+    {
+	if ( data_size < sizeof(wia_except_list_t) )
+	    return ERROR0(ERR_WIA_INVALID,
+		"Truncated RVZ exception list: %s\n",sf->f.fname);
+
+	u32 esize = calc_except_size(data,1);
+	*except = data;
+	if (except_size)
+	    *except_size = esize;
+
+	if (!is_compressed)
+	    esize = esize + 3 & ~(u32)3;
+
+	if ( esize > data_size )
+	    return ERROR0(ERR_WIA_INVALID,
+		"Invalid RVZ exception list size: %s\n",sf->f.fname);
+	data      += esize;
+	data_size -= esize;
+    }
+
+    if (packed_size)
+	return unpack_rvz(sf,data,data_size,dest,dest_size,data_offset);
+
+    if ( data_size < dest_size )
+	return ERROR0(ERR_WIA_INVALID,
+	    "RVZ group too small [%x<%x]: %s\n",data_size,dest_size,sf->f.fname);
+
+    memcpy(dest,data,dest_size);
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Read one internal chunk (always a multiple of 2 MiB so that the hash
+// recalculation of read_part_gdata() keeps working) by assembling it from
+// consecutive RVZ groups.  The per-group exception lists are merged into a
+// single list per 2 MiB in 'tempbuf', with the offsets shifted to be relative
+// to the start of that 2 MiB group -- exactly the layout the WIA code expects.
+
+static enumError read_rvz_gdata
+(
+    SuperFile_t		* sf,		// source file
+    u32			group,		// index of the chunk's first group
+    u32			size,		// payload size of the whole chunk
+    bool		have_except,	// true: partition data with exceptions
+    u64			data_offset	// offset of the chunk within its entry
+)
+{
+    DASSERT(sf);
+    DASSERT(sf->wia);
+    wia_controller_t * wia = sf->wia;
+    DASSERT(wia->is_rvz);
+    DASSERT(wia->rvz_groups_per_chunk);
+
+    if ( size > wia->gdata_size )
+	return ERROR0(ERR_WIA_INVALID,
+	    "Access to invalid group: %s\n",sf->f.fname);
+
+    wia->gdata_group = group;
+    memset(wia->gdata,0,wia->gdata_size);
+
+    // payload of one full group
+    const u32 sub_size = have_except
+	? wia->rvz_chunk_size / WII_SECTOR_SIZE * WII_SECTOR_DATA_SIZE
+	: wia->rvz_chunk_size;
+
+    // sectors covered by one group => hash bytes it contributes
+    const u32 sub_hash_size
+	= wia->rvz_chunk_size / WII_SECTOR_SIZE * WII_SECTOR_HASH_SIZE;
+
+    // Merged exception lists are built here.  Reserve the tail of tempbuf for
+    // the hash tables of read_part_gdata(), like the WIA code does.
+    u8 * const except_end
+	= tempbuf + tempbuf_size - WII_GROUP_HASH_SIZE * wia->chunk_groups;
+    u8 * except_out = tempbuf;
+    u16 * cur_count = 0;
+
+    u32 done = 0, index = 0;
+    while ( done < size )
+    {
+	const u32 n = size - done < sub_size ? size - done : sub_size;
+
+	// start a new merged list at every 2 MiB boundary
+	if ( have_except && !( done % WII_GROUP_DATA_SIZE ) )
+	{
+	    if ( except_out + sizeof(wia_except_list_t) > except_end )
+		return ERROR0(ERR_WIA_INVALID,
+		    "Too many RVZ hash exceptions: %s\n",sf->f.fname);
+	    cur_count = (u16*)except_out;
+	    *cur_count = 0;
+	    except_out += sizeof(wia_except_list_t);
+	}
+
+	const u8 * except = 0;
+	u32 except_size = 0;
+	enumError err = read_rvz_group( sf, group+index, wia->gdata+done, n,
+				data_offset + (u64)index * sub_size,
+				have_except ? &except : 0, &except_size );
+	if (err)
+	    return err;
+
+	if ( have_except && except )
+	{
+	    DASSERT(cur_count);
+	    const u32 n_except = be16(except);
+	    if ( except_out + n_except * sizeof(wia_exception_t) > except_end )
+		return ERROR0(ERR_WIA_INVALID,
+		    "Too many RVZ hash exceptions: %s\n",sf->f.fname);
+
+	    // offsets are relative to the group, shift them to the 2 MiB unit
+	    const u16 add = done % WII_GROUP_DATA_SIZE
+			  / WII_SECTOR_DATA_SIZE * WII_SECTOR_HASH_SIZE;
+	    DASSERT( add + sub_hash_size <= WII_GROUP_HASH_SIZE );
+
+	    const u8 * src = except + sizeof(wia_except_list_t);
+	    uint i;
+	    for ( i = 0; i < n_except; i++, src += sizeof(wia_exception_t) )
+	    {
+		wia_exception_t ex;
+		memcpy(&ex,src,sizeof(ex));
+		ex.offset = htons( ntohs(ex.offset) + add );
+		memcpy(except_out,&ex,sizeof(ex));
+		except_out += sizeof(ex);
+	    }
+	    *cur_count = htons( ntohs(*cur_count) + n_except );
+	}
+
+	done += n;
+	index++;
+    }
+
+    // A short last chunk still needs one (empty) exception list per 2 MiB,
+    // because read_part_gdata() always walks 'chunk_groups' of them.
+    if (have_except)
+    {
+	u32 lists = ( size + WII_GROUP_DATA_SIZE - 1 ) / WII_GROUP_DATA_SIZE;
+	for ( ; lists < wia->chunk_groups; lists++ )
+	{
+	    if ( except_out + sizeof(wia_except_list_t) > except_end )
+		return ERROR0(ERR_WIA_INVALID,
+		    "Too many RVZ hash exceptions: %s\n",sf->f.fname);
+	    *(u16*)except_out = 0;
+	    except_out += sizeof(wia_except_list_t);
+	}
+    }
+
+    return ERR_OK;
+}
+
+static enumError read_gdata
+(
+    SuperFile_t		* sf,		// source file
+    u32			group,		// group index
+    u32			size,		// group size
+    bool		have_except,	// true: data contains exception list and
+					// the exception list is stored in tempbuf
+    u64			data_offset	// RVZ only: offset of the chunk within
+					// its raw data / partition data entry
+)
+{
+    DASSERT(sf);
+    DASSERT(sf->wia);
+    wia_controller_t * wia = sf->wia;
+
+    if (wia->is_rvz)
+	return read_rvz_gdata(sf,group,size,have_except,data_offset);
 
     if ( group >= wia->group_used || size > wia->gdata_size )
 	return ERROR0(ERR_WIA_INVALID,
@@ -653,7 +1077,9 @@ static enumError read_part_gdata
     SuperFile_t		* sf,		// source file
     u32			part_index,	// partition index
     u32			group,		// group index
-    u32			size		// group size
+    u32			size,		// group size
+    u64			data_offset	// RVZ only: offset of the chunk within
+					// the partition data (hashes excluded)
 )
 {
     DASSERT(sf);
@@ -661,7 +1087,8 @@ static enumError read_part_gdata
 
     noPRINT("SIZE = %x -> %x\n", size, size / WII_SECTOR_SIZE * WII_SECTOR_DATA_SIZE );
     enumError err = read_gdata( sf, group,
-				size / WII_SECTOR_SIZE * WII_SECTOR_DATA_SIZE, true );
+				size / WII_SECTOR_SIZE * WII_SECTOR_DATA_SIZE,
+				true, data_offset );
     if (err)
 	return err;
     
@@ -848,7 +1275,8 @@ enumError ReadWIA
 		    const int base_sector = item->offset / WII_SECTOR_SIZE;
 		    const int sector      = overlap1 / WII_SECTOR_SIZE - base_sector;
 		    const int base_group  = sector / wia->chunk_sectors;
-		    const int group       = base_group + ntohl(rdata->group_index);
+		    const u32 gpc         = wia->is_rvz ? wia->rvz_groups_per_chunk : 1;
+		    const int group       = base_group * gpc + ntohl(rdata->group_index);
 
 		    u64 base_off = base_sector * (u64)WII_SECTOR_SIZE
 				 + base_group  * (u64)wia->chunk_size;
@@ -868,7 +1296,8 @@ enumError ReadWIA
 			noPRINT("----- SETUP RAW%4u GROUP %4u/%4u>%4u, off=%9llx, size=%6llx\n",
 				item->index, base_group, ntohl(rdata->n_groups), group,
 				base_off, end_off - base_off );
-			enumError err = read_gdata( sf, group, end_off - base_off, false );
+			enumError err = read_gdata( sf, group, end_off - base_off, false,
+					(u64)base_group * gpc * wia->rvz_chunk_size );
 			DASSERT( group == wia->gdata_group );
 			if (err)
 			    return err;
@@ -900,14 +1329,19 @@ enumError ReadWIA
 
 		while ( overlap1 < overlap2 )
 		{
-		    int group = ( overlap1 - item->offset ) / wia->chunk_size;
-		    DASSERT( group < pd->n_groups );
-		    u64 base_off = item->offset + group * (u64)wia->chunk_size;
+		    int chunk = ( overlap1 - item->offset ) / wia->chunk_size;
+		    u64 base_off = item->offset + chunk * (u64)wia->chunk_size;
 		    u64 end_off  = base_off + wia->chunk_size;
 		    if ( end_off > end )
 			 end_off = end;
 
-		    group += pd->group_index;
+		    // The RVZ PRNG offset counts the stored (hash free) bytes,
+		    // but is still taken modulo the full 32 KiB sector size.
+		    const u32 gpc = wia->is_rvz ? wia->rvz_groups_per_chunk : 1;
+		    const u64 part_data_off = (u64)chunk * gpc
+			* ( wia->rvz_chunk_size / WII_SECTOR_SIZE * WII_SECTOR_DATA_SIZE );
+
+		    int group = chunk * gpc + pd->group_index;
 		    DASSERT( group >= 0 && group < wia->group_used );
 
 		    if ( group != wia->gdata_group || item->index != wia->gdata_part )
@@ -917,7 +1351,8 @@ enumError ReadWIA
 				group - pd->group_index, pd->n_groups, group,
 				base_off, end_off-base_off );
 			enumError err
-			    = read_part_gdata( sf, item->index, group, end_off-base_off );
+			    = read_part_gdata( sf, item->index, group, end_off-base_off,
+						part_data_off );
 			if (err)
 			    return err;
 		    }
@@ -1031,6 +1466,7 @@ enumError SetupReadWIA
 	return err;
 
     const bool is_wia = IsWIA(fhead,sizeof(*fhead),0,0,0);
+    wia->is_rvz = is_wia && !memcmp(fhead->magic,RVZ_MAGIC,RVZ_MAGIC_SIZE);
     wia_ntoh_file_head(fhead,fhead);
     if ( !is_wia || fhead->disc_size > MiB )
 	return ERROR0(ERR_WIA_INVALID,"Invalid file header: %s\n",sf->f.fname);
@@ -1085,7 +1521,26 @@ enumError SetupReadWIA
     wia_ntoh_disc(disc,(wia_disc_t*)tempbuf);
 
     AllocBufferWIA(wia,disc->chunk_size,false,false);
-    if ( wia->chunk_size != disc->chunk_size )
+    if (wia->is_rvz)
+    {
+	// RVZ allows chunk sizes down to 32 KiB.  The hash recalculation needs
+	// full 2 MiB groups, so keep the internal chunk at the WIA size and
+	// assemble it from several RVZ groups.
+	wia->rvz_chunk_size = disc->chunk_size;
+	if ( wia->rvz_chunk_size < RVZ_MIN_CHUNK_SIZE
+	  || wia->rvz_chunk_size & wia->rvz_chunk_size-1
+			&& wia->rvz_chunk_size % WII_GROUP_SIZE
+	  || wia->chunk_size % wia->rvz_chunk_size )
+	{
+	    return ERROR0(ERR_WIA_INVALID,
+		"Unsupported RVZ chunk size %s: %s\n",
+		wd_print_size_1024(0,0,disc->chunk_size,false), sf->f.fname );
+	}
+	wia->rvz_groups_per_chunk = wia->chunk_size / wia->rvz_chunk_size;
+	PRINT("RVZ: chunk=%u, rvz_chunk=%u, groups/chunk=%u\n",
+		wia->chunk_size, wia->rvz_chunk_size, wia->rvz_groups_per_chunk );
+    }
+    else if ( wia->chunk_size != disc->chunk_size )
 	return ERROR0(ERR_WIA_INVALID,
 	    "Only multiple of %s, but not %s, are supported as a chunk size: %s\n",
 		wd_print_size_1024(0,0,wia->chunk_size,false),
@@ -1153,6 +1608,17 @@ enumError SetupReadWIA
 	    wia->memory_usage += CalcMemoryUsageLZMA2(disc->compr_level,false);
 	    break;
 
+	case WD_COMPR_ZSTD:
+	 #ifdef NO_ZSTD
+	    return ERROR0(ERR_NOT_IMPLEMENTED,
+			"No Zstandard support in this build! Sorry!\n");
+	 #else
+	    if (!wia->is_rvz)
+		return ERROR0(ERR_WIA_INVALID,
+			"Zstandard is only valid for RVZ: %s\n",sf->f.fname);
+	    break;
+	 #endif
+
 	default:
 	    return ERROR0(ERR_NOT_IMPLEMENTED,
 			"No support for compression method #%u (%x/hex, %s)\n",
@@ -1192,10 +1658,43 @@ enumError SetupReadWIA
 	const u32 group_len = wia->group_used * sizeof(wia_group_t);
 	wia->group = MALLOC(group_len);
 
-	err = read_data( sf, disc->group_off, disc->group_size,
-			 0, wia->group, group_len );
-	if (err)
-	    return err;
+	if (wia->is_rvz)
+	{
+	    // RVZ stores 12 byte entries: split them into the 8 byte WIA
+	    // layout plus the two RVZ specific side tables, so that all
+	    // shared code below keeps working unchanged.
+	    const u32 rvz_len = wia->group_used * sizeof(rvz_group_t);
+	    rvz_group_t * rgrp = MALLOC(rvz_len);
+	    err = read_data( sf, disc->group_off, disc->group_size,
+			     0, rgrp, rvz_len );
+	    if (err)
+	    {
+		FREE(rgrp);
+		return err;
+	    }
+
+	    wia->rvz_packed_size = MALLOC(wia->group_used*sizeof(*wia->rvz_packed_size));
+	    wia->rvz_compressed  = MALLOC(wia->group_used*sizeof(*wia->rvz_compressed));
+
+	    u32 i;
+	    for ( i = 0; i < wia->group_used; i++ )
+	    {
+		const u32 size = ntohl(rgrp[i].data_size);
+		wia->group[i].data_off4  = rgrp[i].data_off4;
+		wia->group[i].data_size  = htonl( size & RVZ_GROUP_SIZE_MASK );
+		wia->rvz_compressed[i]   = ( size & RVZ_GROUP_COMPRESSED ) != 0;
+		wia->rvz_packed_size[i]  = ntohl(rgrp[i].rvz_packed_size);
+	    }
+	    FREE(rgrp);
+	    wia->memory_usage += rvz_len;
+	}
+	else
+	{
+	    err = read_data( sf, disc->group_off, disc->group_size,
+			     0, wia->group, group_len );
+	    if (err)
+		return err;
+	}
 
 	wia->memory_usage += wia->group_size * sizeof(*wia->group);
     }
@@ -2342,6 +2841,12 @@ enumError SetupWriteWIA
 	case WD_COMPR_PURGE:
 	    // nothing to do
 	    break;
+
+	case WD_COMPR_ZSTD:
+	    // Zstandard only exists in RVZ, and writing RVZ is not supported.
+	    return ERROR0(ERR_NOT_IMPLEMENTED,
+		"Zstandard is only defined for RVZ, which %s can not write.\n",
+		ProgInfo.progname );
 
 	case WD_COMPR_BZIP2:
 	 #ifdef NO_BZIP2
