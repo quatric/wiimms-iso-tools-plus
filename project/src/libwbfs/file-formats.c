@@ -480,6 +480,7 @@ ccp wd_get_compression_name
 	"BZIP2",
 	"LZMA",
 	"LZMA2",
+	"ZSTD",
     };
 
     return (u32)compr < sizeof(tab)/sizeof(*tab) ? tab[compr] : invalid_result;

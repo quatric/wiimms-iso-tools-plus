@@ -284,6 +284,7 @@ typedef enum wd_compression_t
     WD_COMPR_BZIP2,		// use BZIP2 compression
     WD_COMPR_LZMA,		// use LZMA compression
     WD_COMPR_LZMA2,		// use LZMA2 compression
+    WD_COMPR_ZSTD,		// use Zstandard compression (RVZ only)
 
     WD_COMPR__N,		// number of compressions
 

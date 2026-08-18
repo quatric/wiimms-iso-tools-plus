@@ -247,7 +247,7 @@ CFLAGS		+= -I$(DCLIB_DIR)
 
 # other objects
 WIT_O		:= lib-std.o lib-file.o lib-sf.o \
-		   lib-bzip2.o lib-lzma.o lib-dol.o \
+		   lib-bzip2.o lib-lzma.o lib-dol.o lib-lfg.o \
 		   lib-wdf.o lib-wia.o lib-ciso.o lib-gcz.o \
 		   iso-interface.o wbfs-interface.o patch.o \
 		   titles.o match-pattern.o dclib-utf8.o \
@@ -301,6 +301,12 @@ CFLAGS		+= -std=gnu99 -fomit-frame-pointer -fno-strict-aliasing -funroll-loops
 CFLAGS		+= -Wall -Wno-parentheses -Wno-unused-function
 #CFLAGS		+= -O3 -Isrc/libwbfs -Isrc/lzma -Isrc -I$(UI) -I. -Iwork
 CFLAGS		+= -O3 -Isrc/libwbfs -Isrc -I$(UI) -I. -Iwork
+
+ifeq ($(HAVE_ZSTD),1)
+  LIBS		+= -lzstd
+else
+  DEFINES1	+= -DNO_ZSTD=1
+endif
 
 ifeq ($(SYSTEM_LINUX),1)
   LIBS		+= -ltinfo
