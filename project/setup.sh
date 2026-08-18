@@ -70,7 +70,7 @@ GCC_VERSION="$( gcc --version | head -n1 | sed 's/([^)]*)//'|awk '{print $2}' )"
 [[ $GCC_VERSION > 7 ]] && xflags+=" -fdiagnostics-color=always"
 
 gcc $xflags -E -DPRINT_SYSTEM_SETTINGS system.c \
-	| awk -F= '/^result_/ {printf("%s := %s\n",substr($1,8),gensub(/"/,"","g",$2))}' \
+	| awk -F= '/^result_/ { gsub(/"/,"",$2); printf("%s := %s\n",substr($1,8),$2) }' \
 	> Makefile.setup
 
 #--------------------------------------------------
