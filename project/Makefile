@@ -312,13 +312,23 @@ ifeq ($(SYSTEM),cygwin)
 endif
 
 ifeq ($(SYSTEM),mac)
-  CFLAGS	+= -I/usr/local/include
+  CFLAGS	+= -I/opt/homebrew/include -I/usr/local/include
+  CFLAGS	+= -Wno-typedef-redefinition -Wno-gnu-variable-sized-type-not-at-end
+  CFLAGS	+= -Wno-address-of-packed-member
+  LDFLAGS	+= -L/opt/homebrew/lib -L/usr/local/lib
+  # Apple's new linker (Xcode 15+) rejects the under-aligned data emitted for
+  # some dclib tables; the classic linker still accepts them.
+  ifeq ($(shell uname -m),arm64)
+    LDFLAGS	+= -Wl,-ld_classic
+  endif
 else
   LDFLAGS	+= -static-libgcc
 endif
 
 ifeq ($(shell expr $(GCC_VERSION) '>=' 7.0 ),1)
+ifneq ($(SYSTEM),mac)
   CFLAGS	+= -Wno-format-truncation
+endif
 endif
 
 CFLAGS		+= $(XFLAGS)
