@@ -78,7 +78,12 @@ URI_TITLES		= http://gametdb.com/titles.txt
 DOWNLOAD_DIR		= /n/www/wit.wiimm.de/download
 EXPORT_DIR		= /cygdrive/n/wit/wiimms-iso-tools/bin
 
-DUMMY			:= $(shell $(SHELL) ./setup.sh)
+# PRE=$(PRE) is passed explicitly because a command-line `make PRE=...`
+# assignment is a make-level substitution here, not something GNU make
+# exports into the $(shell ...) subprocess's environment -- setup.sh reads
+# $PRE as a normal shell variable, so without this it would silently see
+# PRE unset and probe the host's plain gcc even for a cross build.
+DUMMY			:= $(shell PRE=$(PRE) $(SHELL) ./setup.sh)
 include Makefile.setup
 
 #------------------------------------------------------------------------------
