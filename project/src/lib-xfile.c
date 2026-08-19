@@ -59,10 +59,10 @@ const xformat_info_t xformat_info[XF__N] =
     { XF_WUX,	"WUX",	".wux", "Wii U disc image, sparse",	0,0,1 },
     { XF_NDS,	"NDS",	".nds", "Nintendo DS/DSi cartridge",	1,1,0 },
     { XF_WAD,	"WAD",	".wad", "installable Wii title",	1,1,0 },
-    { XF_CCI,	"CCI",	".3ds", "3DS cartridge image",		0,0,0 },
-    { XF_CIA,	"CIA",	".cia", "3DS installable title",	0,0,0 },
-    { XF_XCI,	"XCI",	".xci", "Switch cartridge image",	0,0,0 },
-    { XF_NSP,	"NSP",	".nsp", "Switch package",		0,0,0 },
+    { XF_CCI,	"CCI",	".3ds", "3DS cartridge image",		1,0,0 },
+    { XF_CIA,	"CIA",	".cia", "3DS installable title",	1,0,0 },
+    { XF_XCI,	"XCI",	".xci", "Switch cartridge image",	1,0,0 },
+    { XF_NSP,	"NSP",	".nsp", "Switch package",		1,0,0 },
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -225,6 +225,18 @@ enumError XInfo ( ccp source )
 	case XF_WAD:
 	    return XInfoWAD(source);
 
+	case XF_CCI:
+	    return XInfoCCI(source);
+
+	case XF_CIA:
+	    return XInfoCIA(source);
+
+	case XF_XCI:
+	    return XInfoXCI(source);
+
+	case XF_NSP:
+	    return XInfoNSP(source);
+
 	default:
 	    // Detected, but nothing beyond the one line above is known yet.
 	    printf("      %s\n",info->info);
@@ -255,6 +267,10 @@ enumError XExtract ( ccp source, ccp dest )
     {
 	case XF_NDS:	return XExtractNDS(source,dest);
 	case XF_WAD:	return XExtractWAD(source,dest);
+	case XF_CCI:	return XExtractCCI(source,dest);
+	case XF_CIA:	return XExtractCIA(source,dest);
+	case XF_XCI:	return XExtractXCI(source,dest);
+	case XF_NSP:	return XExtractNSP(source,dest);
 	default:	return ERROR0(ERR_INTERNAL,0);
     }
 }
