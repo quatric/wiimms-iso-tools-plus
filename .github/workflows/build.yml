@@ -164,11 +164,19 @@ jobs:
           cp *.h "${GITHUB_WORKSPACE}/deps/zstd-universal/"
 
       - name: Build
+        # LDFLAGS is exported as an environment variable rather than passed
+        # as a `make VAR=...` command-line argument on purpose: a command-
+        # line assignment blocks the Makefile's own `LDFLAGS += ...` lines
+        # from taking effect (notably -Wl,-ld_classic, which Xcode 15+'s
+        # newer linker needs to accept some under-aligned dclib data --
+        # without it the link fails with "pointer not aligned" fixup
+        # errors). An exported/environment value doesn't have that problem;
+        # the Makefile's += still appends on top of it normally.
         run: |
           ZDIR="${GITHUB_WORKSPACE}/deps/zstd-universal"
+          export LDFLAGS="-L${ZDIR}/lib"
           make -C project -j"$(sysctl -n hw.ncpu)" \
             XFLAGS="-arch x86_64 -arch arm64 -I${ZDIR}" \
-            LDFLAGS="-L${ZDIR}/lib" \
             all
 
       - name: Verify universal
