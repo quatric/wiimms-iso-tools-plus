@@ -68,6 +68,26 @@ enumError XInfoWAD     ( ccp source );
 enumError XExtractWAD  ( ccp source, ccp dest );
 enumError XCreateWAD   ( ccp source, ccp dest );
 
+//--- 3DS: CCI cartridges and CIA titles (x-3ds.c)
+
+enumError XInfoCCI     ( ccp source );
+enumError XExtractCCI  ( ccp source, ccp dest );
+enumError XCreateCCI   ( ccp source, ccp dest );
+
+enumError XInfoCIA     ( ccp source );
+enumError XExtractCIA  ( ccp source, ccp dest );
+enumError XCreateCIA   ( ccp source, ccp dest );
+
+//--- Switch: XCI cartridges and NSP packages (x-switch.c)
+
+enumError XInfoXCI     ( ccp source );
+enumError XExtractXCI  ( ccp source, ccp dest );
+enumError XCreateXCI   ( ccp source, ccp dest );
+
+enumError XInfoNSP     ( ccp source );
+enumError XExtractNSP  ( ccp source, ccp dest );
+enumError XCreateNSP   ( ccp source, ccp dest );
+
 //
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////                          END                    ///////////////
