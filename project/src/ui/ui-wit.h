@@ -631,6 +631,14 @@ typedef enum enumOptions
 //				| OB_PRESERVE
 //				| OB_OVERWRITE,
 //
+//	OB_CMD_XINFO		= 0,
+//
+//	OB_CMD_XEXTRACT		= OB_OVERWRITE,
+//
+//	OB_CMD_XCREATE		= OB_OVERWRITE,
+//
+//	OB_CMD_XCONVERT		= OB_OVERWRITE,
+//
 //	OB_CMD_COPY		= OB_CMD_EXTRACT
 //				| OB_UPDATE
 //				| OB_DIFF
@@ -765,6 +773,10 @@ typedef enum enumCommands
 	CMD_DIFF,
 	CMD_FDIFF,
 	CMD_EXTRACT,
+	CMD_XINFO,
+	CMD_XEXTRACT,
+	CMD_XCREATE,
+	CMD_XCONVERT,
 	CMD_COPY,
 	CMD_CONVERT,
 	CMD_EDIT,
@@ -778,7 +790,7 @@ typedef enum enumCommands
 	CMD_SKELETON,
 	CMD_MIX,
 
-	CMD__N // == 47
+	CMD__N // == 51
 
 } enumCommands;
 

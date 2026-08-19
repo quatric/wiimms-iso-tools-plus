@@ -1638,6 +1638,10 @@ static const KeywordTab_t CommandTab[] =
     { CMD_DIFF,		"DIFF",		"CMP",		0 },
     { CMD_FDIFF,	"FDIFF",	"FCMP",		0 },
     { CMD_EXTRACT,	"EXTRACT",	"X",		0 },
+    { CMD_XINFO,	"XINFO",	"XI",		0 },
+    { CMD_XEXTRACT,	"XEXTRACT",	"XX",		0 },
+    { CMD_XCREATE,	"XCREATE",	"XC",		0 },
+    { CMD_XCONVERT,	"XCONVERT",	"XV",		0 },
     { CMD_COPY,		"COPY",		"CP",		0 },
     { CMD_CONVERT,	"CONVERT",	"CV",		0 },
     { CMD_CONVERT,	"SCRUB",	"SB",		0 },
@@ -2345,7 +2349,39 @@ static u8 option_allowed_cmd_EXTRACT[107] = // cmd #35
     0,1,0,0,0, 0,0,0,0,0,  0,1,1,1,0, 0,0
 };
 
-static u8 option_allowed_cmd_COPY[107] = // cmd #36
+static u8 option_allowed_cmd_XINFO[107] = // cmd #36
+{
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0
+};
+
+static u8 option_allowed_cmd_XEXTRACT[107] = // cmd #37
+{
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,1,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0
+};
+
+static u8 option_allowed_cmd_XCREATE[107] = // cmd #38
+{
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,1,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0
+};
+
+static u8 option_allowed_cmd_XCONVERT[107] = // cmd #39
+{
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,1,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
+    0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0
+};
+
+static u8 option_allowed_cmd_COPY[107] = // cmd #40
 {
     0,1,1,1,1, 1,1,1,1,1,  1,1,1,0,1, 1,1,1,1,0,  1,1,1,1,1, 1,1,1,1,1,
     1,1,1,1,1, 1,1,1,1,1,  1,1,1,1,1, 1,1,0,1,1,  1,1,1,1,1, 1,1,1,1,1,
@@ -2353,7 +2389,7 @@ static u8 option_allowed_cmd_COPY[107] = // cmd #36
     0,1,0,0,0, 0,0,0,0,0,  0,1,1,1,0, 0,0
 };
 
-static u8 option_allowed_cmd_CONVERT[107] = // cmd #37
+static u8 option_allowed_cmd_CONVERT[107] = // cmd #41
 {
     0,1,1,1,1, 0,1,1,1,1,  1,1,1,0,1, 1,1,1,1,0,  1,1,0,0,0, 0,0,1,1,1,
     1,1,1,1,1, 1,1,1,1,1,  1,1,1,1,1, 1,1,0,1,1,  1,1,1,1,1, 0,0,1,1,1,
@@ -2361,7 +2397,7 @@ static u8 option_allowed_cmd_CONVERT[107] = // cmd #37
     0,0,0,0,0, 0,0,0,0,0,  0,1,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_EDIT[107] = // cmd #38
+static u8 option_allowed_cmd_EDIT[107] = // cmd #42
 {
     0,1,1,1,1, 0,1,1,1,1,  1,1,1,0,1, 0,0,0,0,0,  1,1,0,0,0, 0,0,1,1,1,
     1,1,1,1,1, 1,1,1,1,1,  1,1,1,1,1, 1,1,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
@@ -2369,7 +2405,7 @@ static u8 option_allowed_cmd_EDIT[107] = // cmd #38
     0,0,0,0,0, 0,0,0,0,0,  0,1,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_IMGFILES[107] = // cmd #39
+static u8 option_allowed_cmd_IMGFILES[107] = // cmd #43
 {
     0,1,1,1,1, 0,1,1,1,1,  1,1,1,0,1, 0,0,0,0,1,  0,0,0,0,0, 0,0,0,0,0,
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
@@ -2377,7 +2413,7 @@ static u8 option_allowed_cmd_IMGFILES[107] = // cmd #39
     0,0,0,0,0, 0,0,0,0,0,  0,1,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_REMOVE[107] = // cmd #40
+static u8 option_allowed_cmd_REMOVE[107] = // cmd #44
 {
     0,1,1,1,1, 0,1,1,1,1,  1,1,1,0,1, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
@@ -2385,7 +2421,7 @@ static u8 option_allowed_cmd_REMOVE[107] = // cmd #40
     0,0,0,0,0, 0,0,0,0,0,  0,1,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_MOVE[107] = // cmd #41
+static u8 option_allowed_cmd_MOVE[107] = // cmd #45
 {
     0,1,1,1,1, 0,1,1,1,1,  1,1,1,0,1, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 1,1,0,0,0,
@@ -2393,7 +2429,7 @@ static u8 option_allowed_cmd_MOVE[107] = // cmd #41
     0,0,0,0,0, 0,0,0,0,0,  0,1,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_RENAME[107] = // cmd #42
+static u8 option_allowed_cmd_RENAME[107] = // cmd #46
 {
     0,1,1,1,1, 1,1,1,1,1,  1,1,1,0,1, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
@@ -2401,7 +2437,7 @@ static u8 option_allowed_cmd_RENAME[107] = // cmd #42
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_SETTITLE[107] = // cmd #43
+static u8 option_allowed_cmd_SETTITLE[107] = // cmd #47
 {
     0,1,1,1,1, 1,1,1,1,1,  1,1,1,0,1, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,
@@ -2409,7 +2445,7 @@ static u8 option_allowed_cmd_SETTITLE[107] = // cmd #43
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_VERIFY[107] = // cmd #44
+static u8 option_allowed_cmd_VERIFY[107] = // cmd #48
 {
     0,1,1,1,1, 1,1,1,1,1,  1,1,1,0,1, 1,1,1,1,0,  1,1,0,0,0, 0,0,0,0,0,
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  1,0,0,0,0, 0,0,0,0,0,
@@ -2417,7 +2453,7 @@ static u8 option_allowed_cmd_VERIFY[107] = // cmd #44
     0,1,0,0,1, 0,0,0,0,0,  0,0,0,0,1, 0,0
 };
 
-static u8 option_allowed_cmd_SKELETON[107] = // cmd #45
+static u8 option_allowed_cmd_SKELETON[107] = // cmd #49
 {
     0,1,1,1,1, 1,1,1,1,1,  1,1,1,0,1, 1,1,1,1,0,  1,1,0,0,0, 0,0,0,0,0,
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 1,1,0,0,0,
@@ -2425,7 +2461,7 @@ static u8 option_allowed_cmd_SKELETON[107] = // cmd #45
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0
 };
 
-static u8 option_allowed_cmd_MIX[107] = // cmd #46
+static u8 option_allowed_cmd_MIX[107] = // cmd #50
 {
     0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,0,  0,0,0,0,0, 0,0,0,0,1,
     1,0,0,0,0, 0,0,1,0,0,  0,0,0,0,0, 0,0,1,0,0,  0,0,0,1,0, 1,1,1,1,1,
@@ -3583,6 +3619,44 @@ static const InfoOption_t * option_tab_cmd_EXTRACT[] =
 	OptionInfo + OPT_DEST2,
 	OptionInfo + OPT_ESC,
 	OptionInfo + OPT_PRESERVE,
+	OptionInfo + OPT_OVERWRITE,
+
+	0
+};
+
+static const InfoOption_t * option_tab_cmd_XINFO[] =
+{
+	OptionInfo + OPT_QUIET,
+	OptionInfo + OPT_VERBOSE,
+
+	0
+};
+
+static const InfoOption_t * option_tab_cmd_XEXTRACT[] =
+{
+	OptionInfo + OPT_QUIET,
+	OptionInfo + OPT_VERBOSE,
+	OptionInfo + OPT_TEST,
+	OptionInfo + OPT_OVERWRITE,
+
+	0
+};
+
+static const InfoOption_t * option_tab_cmd_XCREATE[] =
+{
+	OptionInfo + OPT_QUIET,
+	OptionInfo + OPT_VERBOSE,
+	OptionInfo + OPT_TEST,
+	OptionInfo + OPT_OVERWRITE,
+
+	0
+};
+
+static const InfoOption_t * option_tab_cmd_XCONVERT[] =
+{
+	OptionInfo + OPT_QUIET,
+	OptionInfo + OPT_VERBOSE,
+	OptionInfo + OPT_TEST,
 	OptionInfo + OPT_OVERWRITE,
 
 	0
@@ -4806,6 +4880,70 @@ static const InfoCommand_t CommandInfo[CMD__N+1] =
 	68,
 	option_tab_cmd_EXTRACT,
 	option_allowed_cmd_EXTRACT
+    },
+
+    {	CMD_XINFO,
+	false,
+	false,
+	false,
+	"XINFO",
+	"XI",
+	"wit XINFO source...",
+	"Identify and describe containers that are not Wii or GameCube disc"
+	" images: Wii U (WUD/WUX), Nintendo DS, Wii WAD, 3DS and Switch"
+	" images. Formats that are only detected print a single line.",
+	0,
+	2,
+	option_tab_cmd_XINFO,
+	option_allowed_cmd_XINFO
+    },
+
+    {	CMD_XEXTRACT,
+	false,
+	false,
+	false,
+	"XEXTRACT",
+	"XX",
+	"wit XEXTRACT source dest",
+	"Extract a non Wii container into the directory DEST. Supported are"
+	" Nintendo DS cartridges and Wii WADs; see 'wit XINFO' for what a"
+	" given file is.",
+	0,
+	4,
+	option_tab_cmd_XEXTRACT,
+	option_allowed_cmd_XEXTRACT
+    },
+
+    {	CMD_XCREATE,
+	false,
+	false,
+	false,
+	"XCREATE",
+	"XC",
+	"wit XCREATE source dest",
+	"Build a non Wii container from the directory SOURCE, which is"
+	" expected to have the layout 'wit XEXTRACT' produces. The output"
+	" format is taken from the extension of DEST.",
+	0,
+	4,
+	option_tab_cmd_XCREATE,
+	option_allowed_cmd_XCREATE
+    },
+
+    {	CMD_XCONVERT,
+	false,
+	false,
+	false,
+	"XCONVERT",
+	"XV",
+	"wit XCONVERT source dest",
+	"Rewrite a container in a different encoding of the same data. This is"
+	" how Wii U images are converted between WUD and WUX; the output"
+	" format is taken from the extension of DEST.",
+	0,
+	4,
+	option_tab_cmd_XCONVERT,
+	option_allowed_cmd_XCONVERT
     },
 
     {	CMD_COPY,

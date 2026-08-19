@@ -256,6 +256,31 @@
 		"Extract all files of each source to new directory structures."
 		" Images, WBFS partitions and directories are accepted as source."  },
 
+  { T_DEF_CMD,	"XINFO",	"XINFO|XI",
+		    "wit XINFO source...",
+		"Identify and describe containers that are not Wii or GameCube"
+		" disc images: Wii U (WUD/WUX), Nintendo DS, Wii WAD, 3DS and"
+		" Switch images."
+		" Formats that are only detected print a single line." },
+
+  { T_DEF_CMD,	"XEXTRACT",	"XEXTRACT|XX",
+		    "wit XEXTRACT source dest",
+		"Extract a non Wii container into the directory DEST."
+		" Supported are Nintendo DS cartridges and Wii WADs;"
+		" see {wit XINFO} for what a given file is." },
+
+  { T_DEF_CMD,	"XCREATE",	"XCREATE|XC",
+		    "wit XCREATE source dest",
+		"Build a non Wii container from the directory SOURCE, which is"
+		" expected to have the layout {wit XEXTRACT} produces."
+		" The output format is taken from the extension of DEST." },
+
+  { T_DEF_CMD,	"XCONVERT",	"XCONVERT|XV",
+		    "wit XCONVERT source dest",
+		"Rewrite a container in a different encoding of the same data."
+		" This is how Wii U images are converted between WUD and WUX;"
+		" the output format is taken from the extension of DEST." },
+
   { T_DEF_CMD,	"COPY",		"COPY|CP",
 		    "wit COPY source dest\n"
 		    "wit COPY [[--source|--recurse] source]... [-d|-D] dest",
@@ -2120,6 +2145,40 @@
   { T_COPT,	"PRESERVE",	0,0,0 },
   { T_COPT,	"OVERWRITE",	0,0,0 },
 
+
+  //---------- COMMAND wit XINFO ----------
+
+  { T_CMD_BEG,	"XINFO",		0,0,0 },
+
+  { T_COPT,	"QUIET",	0,0,0 },
+  { T_COPT_M,	"VERBOSE",	0,0,0 },
+
+  //---------- COMMAND wit XEXTRACT ----------
+
+  { T_CMD_BEG,	"XEXTRACT",		0,0,0 },
+
+  { T_COPT,	"QUIET",	0,0,0 },
+  { T_COPT_M,	"VERBOSE",	0,0,0 },
+  { T_COPT_M,	"TEST",		0,0,0 },
+  { T_COPT,	"OVERWRITE",	0,0,0 },
+
+  //---------- COMMAND wit XCREATE ----------
+
+  { T_CMD_BEG,	"XCREATE",		0,0,0 },
+
+  { T_COPT,	"QUIET",	0,0,0 },
+  { T_COPT_M,	"VERBOSE",	0,0,0 },
+  { T_COPT_M,	"TEST",		0,0,0 },
+  { T_COPT,	"OVERWRITE",	0,0,0 },
+
+  //---------- COMMAND wit XCONVERT ----------
+
+  { T_CMD_BEG,	"XCONVERT",		0,0,0 },
+
+  { T_COPT,	"QUIET",	0,0,0 },
+  { T_COPT_M,	"VERBOSE",	0,0,0 },
+  { T_COPT_M,	"TEST",		0,0,0 },
+  { T_COPT,	"OVERWRITE",	0,0,0 },
 
   //---------- COMMAND wit COPY ----------
 

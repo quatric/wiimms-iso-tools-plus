@@ -29,13 +29,20 @@ behaviour is unchanged; everything here is additive.
 
 ### Format support
 
-| Format | Read | Write | Notes |
-|---|---|---|---|
-| ISO / WDF / CISO / WBFS / WIA / GCZ / FST | yes | yes | upstream |
-| **RVZ** | **yes** | no | Dolphin's WIA derivative: Zstandard, sub-2 MiB chunks and losslessly packed pseudo-random padding |
-| NKit | planned | planned | |
-| WUX / WUD (Wii U) | planned | planned | |
-| NDS / 3DS / Switch / WAD | planned | planned | |
+Wii and GameCube disc images keep going through WIT's normal commands.  The
+other containers have nothing in common with a Wii disc, so instead of forcing
+them into that pipeline they get their own four commands — `XINFO`, `XEXTRACT`,
+`XCREATE` and `XCONVERT` — which never touch the disc code.
+
+| Format | Read | Write | Commands | Notes |
+|---|---|---|---|---|
+| ISO / WDF / CISO / WBFS / WIA / GCZ / FST | yes | yes | all | upstream |
+| **RVZ** | **yes** | no | all | Dolphin's WIA derivative: Zstandard, sub-2 MiB chunks and losslessly packed pseudo-random padding |
+| **WUX / WUD** (Wii U) | **yes** | **yes** | `XINFO`, `XCONVERT` | container conversion in both directions; unpacking the file system needs the per disc key and is not implemented |
+| **NDS** (DS/DSi) | **yes** | **yes** | `XINFO`, `XEXTRACT`, `XCREATE` | full file system, both CPU binaries, overlays and banner |
+| **WAD** (installable Wii title) | **yes** | **yes** | `XINFO`, `XEXTRACT`, `XCREATE` | contents decrypted and re-encrypted, TMD re-signed only when something changed |
+| 3DS (CCI/CIA) / Switch (XCI/NSP) | detect | no | `XINFO` | identified, not yet unpacked |
+| NKit | planned | planned | | upstream detects NKit images and refuses them |
 
 ### RVZ
 
@@ -57,6 +64,60 @@ The implementation follows Dolphin's
 It has been checked against Redump RVZ images for both Wii (every partition hash
 including H3 verifies, so the decoded image is byte-identical to the original
 disc) and GameCube.
+
+### Wii U (WUX / WUD)
+
+WUX is a sparse container: the payload sectors are stored verbatim, but
+identical sectors are stored once and referenced repeatedly, which is what
+makes a 25 GB disc image manageable.  Converting between the two encodings
+needs no key, because it does not touch the payload at all:
+
+```
+wit XCONVERT game.wux game.wud
+wit XCONVERT game.wud game.wux
+wit XINFO    game.wux
+```
+
+The round trip is byte-identical in both directions, including images whose
+size is not a multiple of the sector size.  Reading has been checked against a
+retail Redump WUX; writing dedupes with a hash table and confirms every
+candidate by comparing the stored bytes, so a hash collision can cost time but
+never corrupt the output.
+
+### Nintendo DS
+
+```
+wit XINFO    game.nds
+wit XEXTRACT game.nds game.d/
+wit XCREATE  game.d/ new.nds
+```
+
+`XEXTRACT` writes the header, both CPU binaries (plus the nitro footer when the
+cartridge has one), the overlay tables, the banner, the overlays as
+`overlay/arm9_NNNN.bin`, and the file system under `data/`.  `XCREATE` rebuilds
+the FNT and FAT from the directory, so files may be added, removed or resized.
+
+Rebuilding assigns directory ids depth first and orders names case
+insensitively, which is what the original build tools did: repacking a retail
+cartridge unchanged reproduces its FNT byte for byte and every file keeps its
+exact size and content.  The image is not byte-identical, because retail images
+place file data in a build specific physical order and often leave a large gap
+before it; the rebuilt image is compact and in file id order.
+
+### Wii WAD
+
+```
+wit XINFO    title.wad
+wit XEXTRACT title.wad title.d/
+wit XCREATE  title.d/ new.wad
+```
+
+Contents are decrypted with the title key from the ticket and written as
+`<content id>.app`; each one is checked against its TMD hash, which is the only
+thing that can tell you the key was right.  `XCREATE` re-encrypts them, updates
+the TMD sizes and hashes, and fake signs the TMD — but only if a content
+actually changed, so extracting and repacking an untouched WAD gives back the
+original file byte for byte and a genuinely signed title keeps its signature.
 
 <dl>
 <dt>Note:</dt>

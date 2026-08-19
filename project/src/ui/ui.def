@@ -180,6 +180,30 @@
 	"Extract all files of each source to new directory structures. Images," \
 	" WBFS partitions and directories are accepted as source." )
 
+#:def_cmd( "XINFO", "XINFO|XI", \
+	"wit XINFO source...", \
+	"Identify and describe containers that are not Wii or GameCube disc" \
+	" images: Wii U (WUD/WUX), Nintendo DS, Wii WAD, 3DS and Switch" \
+	" images. Formats that are only detected print a single line." )
+
+#:def_cmd( "XEXTRACT", "XEXTRACT|XX", \
+	"wit XEXTRACT source dest", \
+	"Extract a non Wii container into the directory DEST. Supported are" \
+	" Nintendo DS cartridges and Wii WADs; see {wit XINFO} for what a" \
+	" given file is." )
+
+#:def_cmd( "XCREATE", "XCREATE|XC", \
+	"wit XCREATE source dest", \
+	"Build a non Wii container from the directory SOURCE, which is" \
+	" expected to have the layout {wit XEXTRACT} produces. The output" \
+	" format is taken from the extension of DEST." )
+
+#:def_cmd( "XCONVERT", "XCONVERT|XV", \
+	"wit XCONVERT source dest", \
+	"Rewrite a container in a different encoding of the same data. This is" \
+	" how Wii U images are converted between WUD and WUX; the output" \
+	" format is taken from the extension of DEST." )
+
 #:def_cmd( "COPY", "COPY|CP", \
 	"wit COPY source dest\n" \
 	"wit COPY [[--source|--recurse] source]... [-d|-D] dest", \
@@ -3976,6 +4000,62 @@
 	"" )
 
 #:def_cmd_opt( "EXTRACT", "OVERWRITE", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XINFO", "QUIET", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XINFO", "VERBOSE", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XEXTRACT", "QUIET", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XEXTRACT", "VERBOSE", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XEXTRACT", "TEST", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XEXTRACT", "OVERWRITE", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCREATE", "QUIET", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCREATE", "VERBOSE", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCREATE", "TEST", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCREATE", "OVERWRITE", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCONVERT", "QUIET", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCONVERT", "VERBOSE", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCONVERT", "TEST", \
+	"", \
+	"" )
+
+#:def_cmd_opt( "XCONVERT", "OVERWRITE", \
 	"", \
 	"" )
 

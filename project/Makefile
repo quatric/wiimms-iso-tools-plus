@@ -247,9 +247,10 @@ CFLAGS		+= -I$(DCLIB_DIR)
 
 # other objects
 WIT_O		:= lib-std.o lib-file.o lib-sf.o \
-		   lib-bzip2.o lib-lzma.o lib-dol.o lib-lfg.o \
+		   lib-bzip2.o lib-lzma.o lib-dol.o lib-lfg.o lib-wux.o \
 		   lib-wdf.o lib-wia.o lib-ciso.o lib-gcz.o \
 		   iso-interface.o wbfs-interface.o patch.o \
+		   lib-xfile.o x-wiiu.o x-nds.o x-wad.o \
 		   titles.o match-pattern.o dclib-utf8.o \
 		   sha1dgst.o sha1_one.o \
 		   $(DCLIB_O)
