@@ -86,7 +86,7 @@ jobs:
         run: |
           cd project
           ./bin/wit VERSION
-          ./bin/wdf VERSION
+          ./bin/wdf +VERSION
 
       - name: Stage binaries
         run: |
@@ -181,7 +181,7 @@ jobs:
         run: |
           cd project
           ./bin/wit VERSION
-          ./bin/wdf VERSION
+          ./bin/wdf +VERSION
 
       - name: Stage binaries
         run: |
