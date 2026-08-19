@@ -2,6 +2,4 @@
 *.h linguist-language=C
 *.inc linguist-language=C
 
-*.sh text eol=lf
-Makefile* text eol=lf
-*.mk text eol=lf
+* text=auto eol=lf
