@@ -59,6 +59,7 @@
 #include "wiidisc.h"
 #include "lib-std.h"
 #include "lib-sf.h"
+#include "lib-xfile.h"
 #include "titles.h"
 #include "iso-interface.h"
 #include "wbfs-interface.h"
@@ -3003,6 +3004,131 @@ enumError exec_extract ( SuperFile_t * fi, Iterator_t * it )
 
 //-----------------------------------------------------------------------------
 
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////		command XINFO, XEXTRACT, XCREATE, XCONVERT	///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// These four commands work on containers that are not Wii or GameCube disc
+// images and therefore never touch SuperFile_t; see lib-xfile.h.
+
+static enumError cmd_xinfo()
+{
+    if ( verbose >= 0 )
+	print_title(stdout);
+
+    enumError max_err = ERR_OK;
+    ParamList_t *param;
+    for ( param = first_param; param; param = param->next )
+    {
+	const enumError err = XInfo(param->arg);
+	if ( max_err < err )
+	    max_err = err;
+    }
+    return max_err;
+}
+
+//-----------------------------------------------------------------------------
+
+// The three remaining commands all take exactly one source and one
+// destination, so they share the argument handling.
+
+static enumError get_two_params ( ccp *source, ccp *dest )
+{
+    ParamList_t *param = first_param;
+    if ( !param || !param->next || param->next->next )
+	return ERROR0(ERR_SYNTAX,
+		"Exactly 2 parameters expected: source and destination.\n");
+    *source = param->arg;
+    *dest   = param->next->arg;
+    return ERR_OK;
+}
+
+//-----------------------------------------------------------------------------
+
+static enumError check_dest ( ccp dest )
+{
+    struct stat st;
+    if ( !stat(dest,&st) && !OptionUsed[OPT_OVERWRITE] )
+	return ERROR0(ERR_ALREADY_EXISTS,
+		"Destination already exists (use --overwrite): %s\n",dest);
+    return ERR_OK;
+}
+
+//-----------------------------------------------------------------------------
+
+static enumError cmd_xextract()
+{
+    if ( verbose >= 0 )
+	print_title(stdout);
+
+    ccp source, dest;
+    enumError err = get_two_params(&source,&dest);
+    if (err)
+	return err;
+    err = check_dest(dest);
+    if (err)
+	return err;
+
+    if (testmode)
+    {
+	printf("WOULD EXTRACT %s -> %s\n",source,dest);
+	return ERR_OK;
+    }
+    return XExtract(source,dest);
+}
+
+//-----------------------------------------------------------------------------
+
+static enumError cmd_xcreate()
+{
+    if ( verbose >= 0 )
+	print_title(stdout);
+
+    ccp source, dest;
+    enumError err = get_two_params(&source,&dest);
+    if (err)
+	return err;
+    err = check_dest(dest);
+    if (err)
+	return err;
+
+    if (testmode)
+    {
+	printf("WOULD CREATE %s -> %s\n",source,dest);
+	return ERR_OK;
+    }
+    return XCreate(source,dest,XF_UNKNOWN);
+}
+
+//-----------------------------------------------------------------------------
+
+static enumError cmd_xconvert()
+{
+    if ( verbose >= 0 )
+	print_title(stdout);
+
+    ccp source, dest;
+    enumError err = get_two_params(&source,&dest);
+    if (err)
+	return err;
+    err = check_dest(dest);
+    if (err)
+	return err;
+
+    if (testmode)
+    {
+	printf("WOULD CONVERT %s -> %s\n",source,dest);
+	return ERR_OK;
+    }
+    return XConvert(source,dest,XF_UNKNOWN);
+}
+
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////			command EXTRACT			///////////////
+///////////////////////////////////////////////////////////////////////////////
+
 static enumError cmd_extract()
 {
     if ( verbose >= 0 )
@@ -4450,6 +4576,10 @@ enumError CheckCommand ( int argc, char ** argv )
 
 	case CMD_DIFF:		err = cmd_diff(false); break;
 	case CMD_FDIFF:		err = cmd_diff(true); break;
+	case CMD_XINFO:		err = cmd_xinfo(); break;
+	case CMD_XEXTRACT:	err = cmd_xextract(); break;
+	case CMD_XCREATE:	err = cmd_xcreate(); break;
+	case CMD_XCONVERT:	err = cmd_xconvert(); break;
 	case CMD_EXTRACT:	err = cmd_extract(); break;
 	case CMD_COPY:		err = cmd_copy(); break;
 	case CMD_CONVERT:	err = cmd_convert(); break;
