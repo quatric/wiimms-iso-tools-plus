@@ -74,10 +74,14 @@ done
 
 #--------------------------------------------------
 
-GCC_VERSION="$( gcc --version | head -n1 | sed 's/([^)]*)//'|awk '{print $2}' )"
+GCC_VERSION="$( ${PRE}gcc --version | head -n1 | sed 's/([^)]*)//'|awk '{print $2}' )"
 [[ $GCC_VERSION > 7 ]] && xflags+=" -fdiagnostics-color=always"
 
-gcc $xflags -E -DPRINT_SYSTEM_SETTINGS system.c \
+# Probe the actual target compiler ($PRE-prefixed for a cross build), not
+# the host's plain gcc -- otherwise SYSTEM/ARCH come out as the build
+# machine's, and makefiles-local/Makefile.local.$(SYSTEM) then injects
+# host-specific flags (e.g. -march=x86-64) into a cross-arm64/armhf build.
+${PRE}gcc $xflags -E -DPRINT_SYSTEM_SETTINGS system.c \
 	| awk -F= '/^result_/ { gsub(/"/,"",$2); printf("%s := %s\n",substr($1,8),$2) }' \
 	> Makefile.setup
 
