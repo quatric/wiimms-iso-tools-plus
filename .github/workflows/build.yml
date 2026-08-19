@@ -160,7 +160,7 @@ jobs:
             cp libzstd.a "../out-$arch/"
           done
           mkdir -p "${GITHUB_WORKSPACE}/deps/zstd-universal/lib"
-          lipo -create out-arm64/libzstd.a out-x86_64/libzstd.a -output "${GITHUB_WORKSPACE}/deps/zstd-universal/lib/libzstd.a"
+          lipo -create ../out-arm64/libzstd.a ../out-x86_64/libzstd.a -output "${GITHUB_WORKSPACE}/deps/zstd-universal/lib/libzstd.a"
           cp *.h "${GITHUB_WORKSPACE}/deps/zstd-universal/"
 
       - name: Build
