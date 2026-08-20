@@ -3333,5 +3333,308 @@ static enumError nkit_partition_stream_write
 
 //
 ///////////////////////////////////////////////////////////////////////////////
+///////////////	 Checksums/Crc.cs, Checksums/NCrc.cs -> nkit_crc_t	///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// This is the last remaining supporting-type prerequisite before the outer
+// Read()/NkitRestoreWii() driver (see the file header) can be ported: Read()
+// wraps its output stream in a CryptoStream over an NCrc, takes
+// crc.Snapshot(name) checkpoints throughout the restore loop, and afterward
+// walks crc.Crcs calling patchGroups()/hashPatchGroup()/fstPatch() to
+// rebuild the patch blobs for hash-store-preserved/scrubbed groups, finally
+// validating the result against an embedded NKit CRC via
+// pc.ReaderCheckPoint2Complete(...). None of that (Read(), patchGroups(),
+// hashPatchGroup(), fstPatch(), or XCONVERT dispatch) is ported here --
+// this section is only the checksum plumbing they all sit on top of.
+//
+// Crc (Checksums/Crc.cs) is a standard reflected CRC-32: poly 0xEDB88320,
+// init 0xFFFFFFFF, HashCore ties itself in knots with an optional
+// multi-threaded ProcessBlock() split + Crc.Combine() re-join (see
+// "Combine" below for why that part IS needed), but the underlying table
+// and per-byte update (ProcessBlock(), Crc.cs:112-153) is byte-for-byte the
+// classic zlib/PKZIP CRC-32 -- and this repo already has exactly that table
+// and update loop as CalcCRC32()/TableCRC32 (dclib/dclib-numeric.c,
+// dclib/dclib-tables.c): same poly (confirmed against TableCRC32[1] ==
+// 0x77073096 == Crc.cs's table), same init/final invert convention
+// (CalcCRC32 does crc=~crc on entry and returns ~crc, so calling it with a
+// running non-inverted accumulator across multiple chunks reproduces
+// Crc.cs's HashCore/Value exactly). So the per-byte engine below is NOT
+// reimplemented a second time -- nkit_crc_update() just calls CalcCRC32().
+// What genuinely IS new here is NCrc's checkpoint/patch-CRC bookkeeping
+// (Snapshot(), FullCrc(bool), the Crcs list) and Crc.Combine()'s GF(2)
+// polynomial-combination algorithm that FullCrc() depends on to re-derive
+// the CRC of the whole stream from independently-computed per-checkpoint
+// segment CRCs (needed so a patched segment's CRC can be substituted in
+// without re-hashing the untouched segments around it).
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Direct port of CrcItem (Checksums/NCrc.cs:9-22): one named checkpoint.
+// PatchData/PatchFile/PatchCrc are `internal set` in C# -- i.e. written
+// later by patchGroups()/hashPatchGroup() (not ported here), never by
+// Snapshot() itself. NULL/0/empty here until that code exists.
+typedef struct nkit_crc_item_t
+{
+    u8		*patch_data;	// PatchData: owned, NULL until set by (future) patchGroups()
+    uint	patch_data_size; // C# byte[] carries its own length; needed here since
+				// patch_data has no implicit size
+    char	*patch_file;	// PatchFile: owned string, NULL until set
+    u32		patch_crc;	// PatchCrc: 0 until set (0 == "no patch" throughout FullCrc())
+    u64		offset;		// Offset
+    u64		length;		// Length
+    u32		value;		// Value: raw (uninverted-output) CRC of just this segment
+    char	*name;		// Name: owned string
+}
+nkit_crc_item_t;
+
+// ToString() (NCrc.cs:18-21) -- not ported: no caller yet (debug/log-only
+// in the original; add if/when the Read() port needs it).
+
+static void nkit_crc_item_reset_mem ( nkit_crc_item_t *it )
+{
+    if (it->patch_data) FREE(it->patch_data);
+    if (it->patch_file) FREE(it->patch_file);
+    if (it->name)       FREE(it->name);
+    memset(it,0,sizeof(*it));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Direct port of NCrc (Checksums/NCrc.cs:24-105): a Crc subclass that,
+// instead of just accumulating one running value, buffers a *list* of named
+// checkpoints -- each checkpoint's Value is the CRC of only the bytes
+// written since the previous Snapshot(), and FullCrc() re-combines them
+// into the CRC of the whole stream via Crc.Combine().
+//
+// The private ctor NCrc(IEnumerable<CrcItem> crcs) (NCrc.cs:32-35, used to
+// rehydrate an NCrc from a previously-saved Crcs[] without re-hashing) is
+// not ported: no caller in the C# reaches it either (it's dead code in
+// NkitReaderWii.cs as far as the Read() investigation found) -- add it back
+// only if a real caller turns up during the Read() port.
+typedef struct nkit_crc_t
+{
+    u64			count;		// _count: total bytes ever pushed through
+					// HashCore/nkit_crc_update, across all segments
+    u64			start_pos;	// _startPos: _count value at the start of the
+					// current (not-yet-snapshotted) segment
+    bool		need_reset;	// _reset: true if base.Initialize() (crc=0xFFFFFFFF)
+					// still needs to run before the next byte
+    u32			value;		// base._value (Crc._value): the running raw
+					// (not yet ~-inverted) CRC of the current segment
+
+    nkit_crc_item_t	*crcs;		// _crcs: owned, growable list of checkpoints (Crcs)
+    uint		n_crcs;		// _crcs.Count
+    uint		crcs_cap;	// allocated capacity of 'crcs'
+}
+nkit_crc_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
+// ctor: NCrc() (NCrc.cs:37-43) == base() (Crc.cs:48-51, Initialize() sets
+// _value = 0xFFFFFFFF) with _startPos/_count = 0, _reset = true.
+static void nkit_crc_init ( nkit_crc_t *c )
+{
+    memset(c,0,sizeof(*c));
+    c->value      = 0xFFFFFFFF; // Crc._KInitial, applied by Crc..ctor()->Initialize()
+    c->need_reset = true;
+}
+
+static void nkit_crc_reset_mem ( nkit_crc_t *c )
+{
+    for ( uint i = 0; i < c->n_crcs; i++ )
+	nkit_crc_item_reset_mem(c->crcs+i);
+    if (c->crcs)
+	FREE(c->crcs);
+    memset(c,0,sizeof(*c));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// private reset() (NCrc.cs:54-62): lazily (re)start a fresh segment. Called
+// from both Snapshot() and HashCore() before either touches _value, exactly
+// like the C#.
+static void nkit_crc_reset_segment ( nkit_crc_t *c )
+{
+    if (c->need_reset)
+    {
+	c->start_pos  = c->count;
+	c->value      = 0xFFFFFFFF; // base.Initialize()
+	c->need_reset = false;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// HashCore(byte[] data, int offset, int count) (NCrc.cs:64-69), i.e. every
+// byte NKit's CryptoStream-wrapped output stream ever writes during Read()
+// eventually funnels through here. Renamed from the override name since
+// there's no virtual dispatch in C -- this is the one and only "write N
+// bytes to the CRC" entry point (Crc.cs's own HashCore threading-split
+// logic is not reproduced: CalcCRC32() is already a plain single-pass
+// per-byte table walk with no thread-count-dependent codepath to match, and
+// nothing here needs the Combine-based multithread reassembly Crc.cs uses
+// to make its own split path agree with the sequential one).
+static void nkit_crc_update ( nkit_crc_t *c, const u8 *data, u32 size )
+{
+    nkit_crc_reset_segment(c);
+    c->count += size;
+    c->value = CalcCRC32(c->value,data,size); // base.HashCore(data,offset,count)
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Snapshot(string name) (NCrc.cs:45-52): close out the current segment as a
+// named checkpoint. No-op if the previous checkpoint already covers the
+// current position (nothing written since) -- same dedup the C# does.
+static void nkit_crc_snapshot ( nkit_crc_t *c, const char *name )
+{
+    if ( c->n_crcs != 0 && c->crcs[c->n_crcs-1].offset == c->start_pos )
+	return; // don't create 2 for same offset
+
+    nkit_crc_reset_segment(c);
+
+    if ( c->n_crcs == c->crcs_cap )
+    {
+	c->crcs_cap = c->crcs_cap ? c->crcs_cap*2 : 16;
+	c->crcs = REALLOC(c->crcs,c->crcs_cap*sizeof(*c->crcs));
+    }
+    nkit_crc_item_t *it = c->crcs + c->n_crcs;
+    memset(it,0,sizeof(*it));
+    it->offset = c->start_pos;
+    it->length = c->count - c->start_pos;
+    it->value  = ~c->value; // base.Value getter (NCrc.cs:50 reads `base.Value`,
+			     // which is Crc.cs:61-64's `~_value` getter -- so
+			     // this is the finished, inverted CRC, matching
+			     // what Combine()/FullCrc() below expect)
+    it->name   = STRDUP(name);
+    c->n_crcs++;
+
+    c->need_reset = true;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+///////////////			Crc.Combine() -> nkit_crc_combine()	///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// Direct port of the GF(2) "combine two CRCs of adjacent byte ranges into
+// the CRC of the concatenation" algorithm (Crc.cs:174-275, itself lifted
+// from the DotNetZip project, ultimately the well-known zlib crc32_combine
+// derivation). FullCrc() below is the only caller, combining a chain of
+// independently-computed per-Snapshot() segment CRCs back into one running
+// total -- exactly the operation zlib's crc32_combine() performs, which is
+// how the length-2 zero-extension trick works: append length2 zero bytes'
+// worth of "CRC shift" operator to crc1, then XOR in crc2.
+//
+// Both crc1/crc2 passed in and returned are the "raw" (already ~-inverted,
+// i.e. Crc.Value-style) form -- callers un-invert going in and re-invert
+// coming out, same dance the C# does (Crc.cs:199-200,223).
+
+static u32 nkit_gf2_matrix_times ( const u32 matrix[32], u32 vec )
+{
+    u32 sum = 0;
+    int i = 0;
+    while (vec)
+    {
+	if ( vec & 1 ) sum ^= matrix[i];
+	vec >>= 1;
+	i++;
+    }
+    return sum;
+}
+
+static void nkit_gf2_matrix_square ( u32 square[32], const u32 mat[32] )
+{
+    for ( int i = 0; i < 32; i++ )
+	square[i] = nkit_gf2_matrix_times(mat,mat[i]);
+}
+
+// Prepare_even_odd_Cache() (Crc.cs:227-244), but computed fresh on every
+// call instead of cached in static fields: it's 2 gf2_matrix_square() calls
+// over 32-word arrays, cheap enough that there's no need to reproduce the
+// C# static-field caching (and no static Crc constructor equivalent to
+// hang it off in C without adding global init-order concerns).
+static void nkit_crc_combine_even_odd ( u32 even[32], u32 odd[32] )
+{
+    odd[0] = 0xEDB88320; // Crc._KCrcPoly
+    for ( int i = 1; i < 32; i++ )
+	odd[i] = 1u << (i-1);
+
+    nkit_gf2_matrix_square(even,odd); // operator for two zero bits
+    nkit_gf2_matrix_square(odd,even); // operator for four zero bits
+}
+
+// Combine(uint crc1, uint crc2, long length2) (Crc.cs:188-224).
+static u32 nkit_crc_combine ( u32 crc1, u32 crc2, u64 length2 )
+{
+    if ( length2 == 0 )      return crc1;
+    if ( crc1 == 0xFFFFFFFF ) return crc2; // == _KInitial
+
+    u32 even[32], odd[32];
+    nkit_crc_combine_even_odd(even,odd);
+
+    crc1 = ~crc1;
+    crc2 = ~crc2;
+
+    u64 len2 = length2;
+    do
+    {
+	nkit_gf2_matrix_square(even,odd);
+	if ( len2 & 1 ) crc1 = nkit_gf2_matrix_times(even,crc1);
+	len2 >>= 1;
+	if ( len2 == 0 ) break;
+
+	nkit_gf2_matrix_square(odd,even);
+	if ( len2 & 1 ) crc1 = nkit_gf2_matrix_times(odd,crc1);
+	len2 >>= 1;
+    }
+    while (len2);
+
+    crc1 ^= crc2;
+    return ~crc1;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// FullCrc() / FullCrc(bool patched) (NCrc.cs:71-86): re-derive the CRC of
+// the entire stream from the per-checkpoint segment CRCs, substituting each
+// checkpoint's PatchCrc in place of its Value when 'patched' is set and a
+// PatchCrc was actually recorded (PatchCrc != 0 acts as "is set" -- same
+// sentinel the C# uses).
+static u32 nkit_crc_full ( const nkit_crc_t *c, bool patched )
+{
+    if ( c->n_crcs == 0 )
+	return 0;
+
+    u32 crc = ( patched && c->crcs[0].patch_crc != 0 ) ? c->crcs[0].patch_crc : c->crcs[0].value;
+    for ( uint i = 1; i < c->n_crcs; i++ )
+    {
+	const nkit_crc_item_t *it = c->crcs+i;
+	u32 seg = ( patched && it->patch_crc != 0 ) ? ~it->patch_crc : ~it->value;
+	crc = ~nkit_crc_combine(~crc,seg,it->length);
+    }
+    return crc;
+}
+
+// Crcs getter (NCrc.cs:88): '_crcs?.ToArray()'. No copy needed in C --
+// callers get the live array + count directly.
+static inline const nkit_crc_item_t *nkit_crc_items ( const nkit_crc_t *c, uint *n )
+{
+    *n = c->n_crcs;
+    return c->crcs;
+}
+
+// indexer this[long position] (NCrc.cs:95-104): CRC of the checkpoint whose
+// Offset == position, or 0 if none. Linear scan, same as the C#'s
+// FirstOrDefault().
+static u32 nkit_crc_at ( const nkit_crc_t *c, u64 position )
+{
+    for ( uint i = 0; i < c->n_crcs; i++ )
+	if ( c->crcs[i].offset == position )
+	    return c->crcs[i].value;
+    return 0;
+}
+
+//
+///////////////////////////////////////////////////////////////////////////////
 ///////////////                          END                    ///////////////
 ///////////////////////////////////////////////////////////////////////////////
