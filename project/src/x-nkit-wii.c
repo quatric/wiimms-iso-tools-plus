@@ -100,6 +100,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include "x-formats.h"
 #include "libwbfs/wiidisc.h"
@@ -1812,6 +1813,489 @@ static enumError nkit_circular_buffer_seek ( nkit_circular_buffer_t *cb, u64 pos
 static void nkit_circular_buffer_mark_write_done ( nkit_circular_buffer_t *cb )
 {
     cb->writing_complete = true;
+}
+
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////  copyFile/writeGap/writeFiller (STAGE 2b, part 1)     ///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// STAGE 2b (part 1) of the Wii restore port: NkitReaderWii.cs's copyFile()
+// (line 572), writeGap() (both overloads, lines 596 and 614) and
+// writeFiller() (line 606). These are the three low-level restore
+// primitives partitionRead()'s per-file loop calls once per FST file; that
+// loop itself (patchGroups/hashPatchGroup/fstPatch, the outer Read(), and
+// XCONVERT dispatch) is explicitly OUT of scope here -- see the file header
+// of the task that added this section. As a direct result, nothing below
+// has a caller yet; that is expected, same as stage 1/2a.
+//
+// Stream roles, ported 1:1 from the C# parameter names:
+//   Stream inStream -> FILE *in_stream   (the raw source .nkit file, read-only)
+//   Stream target    -> nkit_circular_buffer_t *target (the restored-image
+//                        output; C#'s 'target' is the Stream view backing a
+//                        StreamCircularBuffer's write side -- see the type's
+//                        own comment above for why this port keeps the ring
+//                        buffer but not the background thread)
+//   JunkStream junk  -> nkit_junk_read_func junk_get + void *junk_ctx: a
+//                        callback pair standing in for JunkStream's settable
+//                        .Position + .Copy(target,len) (exactly the shape
+//                        x-nkit.c's own nkit_junk_get(nj,pos,dest,size)
+//                        already has for the GC junk generator -- that
+//                        generator lives in x-nkit.c as file-local static
+//                        state and is NOT exposed across translation units,
+//                        so this file takes it as an injected callback
+//                        instead of duplicating/porting JunkStream.cs here.
+//                        Wiring an actual Wii JunkStream equivalent through
+//                        this callback is stage 2b's driver's job.
+//   ScrubManager scrub -> nkit_scrub_manager_t *scrub (STAGE 2a, above)
+
+// Gap/block record format, ported from Gaps.cs's GapType/GapBlockType enums
+// and Gap.BlockSize. This mirrors x-nkit.c's nkit_gap_type_t/
+// nkit_block_type_t/NKIT_GAP_BLOCK_SIZE exactly (same source, Gaps.cs, is
+// shared by both the GC and Wii readers) but is redeclared here rather than
+// shared across translation units, since x-nkit.c keeps its copy file-local
+// static and this file has no header of its own to hold a common copy.
+typedef enum nkit_gap_type_t
+{
+    NKIT_GAP_ALL_JUNK		= 0b00,
+    NKIT_GAP_ALL_SCRUBBED	= 0b01,
+    NKIT_GAP_MIXED		= 0b10,
+    NKIT_GAP_JUNK_FILE		= 0b11,
+}
+nkit_gap_type_t;
+
+typedef enum nkit_block_type_t
+{
+    NKIT_BLOCK_JUNK		= 0b00,
+    NKIT_BLOCK_NONJUNK		= 0b01,
+    NKIT_BLOCK_BYTEFILL		= 0b10,
+    NKIT_BLOCK_REPEAT		= 0b11,
+}
+nkit_block_type_t;
+
+#define NKIT_GAP_BLOCK_SIZE	0x100	// Gap.BlockSize in the C# source
+
+typedef void (*nkit_junk_read_func) ( void *ctx, u64 pos, u8 *dest, u32 size );
+
+// Subset of ConvertFile/FstFile (FileSystem.cs) that copyFile()/writeGap()
+// actually touch: FstFile.Length (read+written back -- writeGap's GapType.
+// JunkFile branch rewrites it), FstFile.Name/DataOffset (copyFile's error
+// message only), and ConvertFile.GapLength (read+written back). The rest of
+// FstFile (Offset, OffsetInFstFile, Parent/Path, ...) belongs to the FST
+// walk that builds/consumes this list -- a later, separate step -- so it's
+// not duplicated here.
+typedef struct nkit_convert_file_t
+{
+    u64		fst_length;		// FstFile.Length
+    ccp		fst_name;		// FstFile.Name (not owned)
+    u64		fst_data_offset;	// FstFile.DataOffset
+    u64		gap_length;		// ConvertFile.GapLength
+}
+nkit_convert_file_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Pump 'size' bytes into the ring buffer, looping over
+// nkit_circular_buffer_write() until all of it is accepted. The C# side
+// (Utils.Copy()'s double-buffered pump into a Stream) blocks until the
+// reader has drained enough room (Monitor.Wait, see nkit_circular_buffer_t's
+// own comment); this port has no background reader to wait on yet, so a
+// short write here (the ring genuinely full) is reported as an error rather
+// than spun on -- interleaving writes with reads so the ring never actually
+// fills is stage 2b driver's job, same as noted on nkit_circular_buffer_t.
+static enumError nkit_cb_write_all ( nkit_circular_buffer_t *target, const u8 *data, u32 size )
+{
+    while (size)
+    {
+	u32 n = nkit_circular_buffer_write(target,data,size);
+	if (!n)
+	    return ERROR0(ERR_INTERNAL,
+		"NKit: restore output ring buffer is full -- driver must interleave reads\n");
+	data += n;
+	size -= n;
+    }
+    return ERR_OK;
+}
+
+// Adapter so nkit_scrub_manager_scrub()'s nkit_write_func callback can write
+// straight into a circular buffer target (used by writeGap's GapType.
+// AllScrubbed and GapBlockType.ByteFill cases, matching scrub.Scrub(target,...)
+// in the C#).
+static enumError nkit_cb_write_adapter ( void *ctx, const u8 *data, u32 size )
+{
+    return nkit_cb_write_all((nkit_circular_buffer_t*)ctx,data,size);
+}
+
+// Shared by every "some/all zero bytes then junk bytes" write pattern below
+// (GapType.JunkFile's trailing junk, GapType.AllJunk, and GapBlockType.Junk
+// blocks): ports the repeated C# pattern
+//   ByteStream.Zeros.Copy(target,nulls); junk.Position = dstPos+nulls; junk.Copy(target,bytes-nulls);
+// -- writes 'nulls' zero bytes to 'target', then (bytes-nulls) bytes of junk
+// generated for the range [dst_pos+nulls, dst_pos+bytes).
+static enumError nkit_write_nulls_then_junk
+(
+    nkit_circular_buffer_t	*target,
+    nkit_junk_read_func		junk_get,
+    void			*junk_ctx,
+    u64				dst_pos,
+    u64				nulls,
+    u64				bytes		// total bytes written == nulls + junk portion
+)
+{
+    static const u8 zeros[0x10000] = {0};
+    u64 rest = nulls;
+    while (rest)
+    {
+	u32 chunk = rest < sizeof(zeros) ? (u32)rest : sizeof(zeros);
+	enumError err = nkit_cb_write_all(target,zeros,chunk);
+	if (err)
+	    return err;
+	rest -= chunk;
+    }
+
+    u8 buf[0x10000];
+    u64 pos = dst_pos + nulls;
+    rest = bytes - nulls;
+    while (rest)
+    {
+	u32 chunk = rest < sizeof(buf) ? (u32)rest : sizeof(buf);
+	junk_get(junk_ctx,pos,buf,chunk);
+	enumError err = nkit_cb_write_all(target,buf,chunk);
+	if (err)
+	    return err;
+	pos  += chunk;
+	rest -= chunk;
+    }
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of copyFile(ConvertFile file, ref long nullsPos, ref long srcPos,
+// long dstPos, Stream inStream, Stream target) -- NkitReaderWii.cs:572-594.
+// Copies one file's bytes verbatim from the source stream to the restored
+// output, 4 byte aligning the copy length the same way the FST rounds file
+// lengths. 'dst_pos' is by value, same as the C# (its only use inside is to
+// compute the outgoing *nulls_pos; the caller advances its own running
+// output position separately, by *out_len).
+static enumError nkit_copy_file
+(
+    nkit_convert_file_t		*file,
+    u64				*nulls_pos,	// ref nullsPos
+    u64				*src_pos,	// ref srcPos
+    u64				dst_pos,
+    FILE			*in_stream,
+    nkit_circular_buffer_t	*target,
+    u64				*out_len	// bytes copied (== source bytes consumed)
+)
+{
+    *out_len = 0;
+
+    u64 size = file->fst_length;
+    if ( size == 0 )
+	return ERR_OK;	// could be legit or junk
+
+    size += size % 4 == 0 ? 0 : 4 - size % 4;
+
+    u8 buf[0x10000];
+    u64 rest = size;
+    while (rest)
+    {
+	u32 chunk = rest < sizeof(buf) ? (u32)rest : sizeof(buf);
+	if ( fread(buf,1,chunk,in_stream) != chunk )
+	    return ERROR1(ERR_READ_FAILED,
+		"NKit: copy file '%s' failed at data position 0x%llx (%llu bytes)\n",
+		file->fst_name ? file->fst_name : "?",
+		(u64)file->fst_data_offset, (u64)file->fst_length);
+	enumError err = nkit_cb_write_all(target,buf,chunk);
+	if (err)
+	    return err;
+	rest -= chunk;
+    }
+
+    *src_pos += size;
+    dst_pos  += size;
+    *nulls_pos = dst_pos + 0x1cL;
+
+    *out_len = size;
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of the private 4-ref-parameter writeGap(ref long fileLength, LongRef
+// gapLength, ref long nullsPos, ref long srcPos, long dstPos, Stream
+// inStream, Stream target, JunkStream junk, bool firstOrLastFile,
+// ScrubManager scrub) -- NkitReaderWii.cs:614-749. Both public overloads
+// (writeGap(ConvertFile,...) and writeFiller(...), below) forward into this
+// core. 'file_length'/'gap_length' are s64 (not u64) purely to carry
+// writeFiller's -1 "ignored" sentinel through unchanged, exactly like C#'s
+// plain 'long'; every actual use only ever compares them against 0, so the
+// sentinel behaves the same whether read as signed or unsigned.
+//
+// Flagged difference from x-nkit.c's GC nkit_decode_gap(): the 0xFFFFFFFC
+// 64 bit size escape a few lines down (C# line ~628) is Wii-only -- GC never
+// emits it (x-nkit.c's version already notes this and treats it as
+// unreachable/defensive; here it's the real, live path).
+static enumError nkit_write_gap_core
+(
+    s64				*file_length,	// ref fileLength
+    s64				*gap_length,	// LongRef gapLength
+    u64				*nulls_pos,	// ref nullsPos
+    u64				*src_pos,	// ref srcPos
+    u64				dst_pos,
+    FILE			*in_stream,
+    nkit_circular_buffer_t	*target,
+    nkit_junk_read_func		junk_get,
+    void			*junk_ctx,
+    bool			first_or_last_file,
+    nkit_scrub_manager_t	*scrub,
+    u64				*out_len	// gapLength.Value + junkFileLen on return
+)
+{
+    *out_len = 0;
+
+    if ( *gap_length == 0 )
+    {
+	if ( *file_length == 0 )
+	    *nulls_pos = dst_pos + 0x1cL;
+	return ERR_OK;
+    }
+
+    // srcLen fix for (padding between junk files) - Zumba Fitness (Europe) (En,Fr,De,Es,It)
+    s64 src_len = *gap_length;
+
+    u8 hdr[4];
+    if ( fread(hdr,1,4,in_stream) != 4 )
+	return ERROR1(ERR_READ_FAILED,"NKit: truncated gap record\n");
+    *src_pos += 4;
+
+    u32 word = be32(hdr);
+    nkit_gap_type_t gt = (nkit_gap_type_t)( word & 0b11 );
+    u64 size = word & 0xFFFFFFFCu;
+
+    if ( size == 0xFFFFFFFCu )		// Wii only 64 bit size extension; not a thing for GC
+    {
+	u8 ext[4];
+	if ( fread(ext,1,4,in_stream) != 4 )
+	    return ERROR1(ERR_READ_FAILED,"NKit: truncated gap 64 bit size extension\n");
+	*src_pos += 4;
+	size = 0xFFFFFFFCull + be32(ext);	// cater for files > 0xFFFFFFFF
+    }
+    *gap_length = (s64)size;
+
+    // keep track of trailing nulls when restoring scrubbed images
+    nkit_scrub_manager_add_gap(scrub,(u64)*file_length,dst_pos,size);
+
+    u64 nulls = 0;
+    u64 junk_file_len = 0;
+
+    // set nullsPos value if zerobyte file without junk
+    if ( gt == NKIT_GAP_JUNK_FILE )
+    {
+	// C#: nullsPos = Math.Min(nullsPos - dstPos, 0); -- ported verbatim,
+	// including the fixed '0' second argument (so this can only ever
+	// clamp to a value <= 0, i.e. it stores a *non-positive delta*, not
+	// an absolute position, same as the original).
+	s64 delta = (s64)*nulls_pos - (s64)dst_pos;
+	*nulls_pos = (u64)( delta < 0 ? delta : 0 );
+
+	u8 lb[4];
+	if ( fread(lb,1,4,in_stream) != 4 )
+	    return ERROR1(ERR_READ_FAILED,"NKit: truncated junk-file length\n");
+	*src_pos += 4;
+	junk_file_len = be32(lb);
+	*file_length = (s64)junk_file_len;
+	junk_file_len += junk_file_len % 4 == 0 ? 0 : 4 - junk_file_len % 4;
+
+	nulls = (size & 0xFC) >> 2;
+	enumError err = nkit_write_nulls_then_junk(target,junk_get,junk_ctx,dst_pos,nulls,junk_file_len);
+	if (err)
+	    return err;
+	dst_pos += junk_file_len;
+
+	if ( src_len <= 8 )
+	{
+	    *out_len = junk_file_len;
+	    return ERR_OK;
+	}
+	else
+	{
+	    // read gap
+	    u8 gb[4];
+	    if ( fread(gb,1,4,in_stream) != 4 )
+		return ERROR1(ERR_READ_FAILED,"NKit: truncated gap record (post junk-file)\n");
+	    *src_pos += 4;
+	    word = be32(gb);
+	    gt = (nkit_gap_type_t)( word & 0b11 );
+	    size = word & 0xFFFFFFFCu;
+	    *gap_length = (s64)size;
+	}
+    }
+    else if ( *file_length == 0 )	// last zero byte file was legit
+	*nulls_pos = dst_pos + 0x1cL;
+
+    u64 max_nulls = *nulls_pos > dst_pos ? *nulls_pos - dst_pos : 0;	// Math.Max(0, nullsPos-dstPos), ~0x1c
+    if ( size < max_nulls )
+	nulls = size;
+    else
+	nulls = size >= 0x40000 && !first_or_last_file ? 0 : max_nulls;
+    *nulls_pos = dst_pos + nulls;	// belt and braces
+
+    if ( gt == NKIT_GAP_ALL_JUNK )
+    {
+	enumError err = nkit_write_nulls_then_junk(target,junk_get,junk_ctx,dst_pos,nulls,size);
+	if (err)
+	    return err;
+	dst_pos += size;
+    }
+    else if ( gt == NKIT_GAP_ALL_SCRUBBED )
+    {
+	enumError err = nkit_scrub_manager_scrub(scrub,nkit_cb_write_adapter,target,dst_pos,size,0);
+	if (err)
+	    return err;
+	dst_pos += size;
+    }
+    else	// NKIT_GAP_MIXED: a stream of 4 byte block records follows
+    {
+	u64 prg = size;
+	nkit_block_type_t bt = NKIT_BLOCK_JUNK;	// should never be used unset
+	u8 fill_byte = 0;
+
+	while ( prg > 0 )
+	{
+	    u8 be[4];
+	    if ( fread(be,1,4,in_stream) != 4 )
+		return ERROR1(ERR_READ_FAILED,"NKit: truncated gap block record\n");
+	    *src_pos += 4;
+	    u32 blk = be32(be);
+	    nkit_block_type_t bt_type = (nkit_block_type_t)( blk >> 30 );
+	    bool bt_repeat = bt_type == NKIT_BLOCK_REPEAT;
+	    if (!bt_repeat)
+		bt = bt_type;
+
+	    u64 cnt = 0x3FFFFFFFu & blk;
+	    u64 bytes;
+
+	    if ( bt == NKIT_BLOCK_NONJUNK )
+	    {
+		bytes = cnt * NKIT_GAP_BLOCK_SIZE;
+		if ( bytes > prg ) bytes = prg;
+
+		u8 buf[0x10000];
+		u64 rest = bytes;
+		while (rest)
+		{
+		    u32 chunk = rest < sizeof(buf) ? (u32)rest : sizeof(buf);
+		    if ( fread(buf,1,chunk,in_stream) != chunk )
+			return ERROR1(ERR_READ_FAILED,"NKit: truncated gap non-junk data\n");
+		    *src_pos += chunk;
+		    enumError err = nkit_cb_write_all(target,buf,chunk);
+		    if (err)
+			return err;
+		    rest -= chunk;
+		}
+	    }
+	    else if ( bt == NKIT_BLOCK_BYTEFILL )
+	    {
+		if (!bt_repeat)
+		{
+		    fill_byte = (u8)( 0xFF & cnt );	// last 8 bits when not repeating are the byte
+		    cnt >>= 8;
+		}
+		bytes = cnt * NKIT_GAP_BLOCK_SIZE;
+		if ( bytes > prg ) bytes = prg;
+
+		enumError err = nkit_scrub_manager_scrub(scrub,nkit_cb_write_adapter,target,dst_pos,bytes,fill_byte);
+		if (err)
+		    return err;
+	    }
+	    else // NKIT_BLOCK_JUNK
+	    {
+		bytes = cnt * NKIT_GAP_BLOCK_SIZE;
+		if ( bytes > prg ) bytes = prg;
+
+		max_nulls = *nulls_pos > dst_pos ? *nulls_pos - dst_pos : 0;
+		if ( prg < max_nulls )
+		    nulls = bytes;
+		else
+		    nulls = bytes >= 0x40000 && !first_or_last_file ? 0 : max_nulls;
+
+		enumError err = nkit_write_nulls_then_junk(target,junk_get,junk_ctx,dst_pos,nulls,bytes);
+		if (err)
+		    return err;
+	    }
+
+	    prg     -= bytes;
+	    dst_pos += bytes;
+	}
+    }
+
+    *out_len = (u64)*gap_length + junk_file_len;
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of writeGap(ConvertFile file, ref long nullsPos, ref long srcPos,
+// long dstPos, Stream inStream, Stream target, JunkStream junk, bool
+// firstOrLastFile, ScrubManager scrub) -- NkitReaderWii.cs:596-604. Thin
+// wrapper unpacking/repacking ConvertFile's two mutated fields around the
+// core above, same as the C#.
+static enumError nkit_write_gap
+(
+    nkit_convert_file_t		*file,
+    u64				*nulls_pos,	// ref nullsPos
+    u64				*src_pos,	// ref srcPos
+    u64				dst_pos,
+    FILE			*in_stream,
+    nkit_circular_buffer_t	*target,
+    nkit_junk_read_func		junk_get,
+    void			*junk_ctx,
+    bool			first_or_last_file,
+    nkit_scrub_manager_t	*scrub,
+    u64				*out_len	// return value of writeGap()
+)
+{
+    s64 file_length = (s64)file->fst_length;
+    s64 gap_length  = (s64)file->gap_length;
+
+    enumError err = nkit_write_gap_core(&file_length,&gap_length,nulls_pos,src_pos,dst_pos,
+	in_stream,target,junk_get,junk_ctx,first_or_last_file,scrub,out_len);
+
+    file->fst_length = (u64)file_length;
+    file->gap_length  = (u64)gap_length;
+    return err;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of writeFiller(ref long srcPos, long dstPos, long nullsPos, Stream
+// inStream, Stream target, JunkStream junk, ScrubManager scrub) --
+// NkitReaderWii.cs:606-612. 'nulls_pos' is by value here (not ref), same as
+// the C# -- it feeds a throwaway local ('ref nullsPos' inside the inner
+// writeGap() call binds to that local, not to any caller-visible state).
+// fileLength/gapLength are the fixed -1 sentinels ("will be ignored" per
+// the C# comment) that make the core treat this as a no-file filler gap.
+static enumError nkit_write_filler
+(
+    u64				*src_pos,	// ref srcPos
+    u64				dst_pos,
+    u64				nulls_pos,	// by value
+    FILE			*in_stream,
+    nkit_circular_buffer_t	*target,
+    nkit_junk_read_func		junk_get,
+    void			*junk_ctx,
+    nkit_scrub_manager_t	*scrub,
+    u64				*out_len	// return value of writeFiller()
+)
+{
+    s64 file_length = -1;	// will be ignored
+    s64 gap_length  = -1;
+    u64 local_nulls_pos = nulls_pos;
+
+    return nkit_write_gap_core(&file_length,&gap_length,&local_nulls_pos,src_pos,dst_pos,
+	in_stream,target,junk_get,junk_ctx,true,scrub,out_len);
 }
 
 //
