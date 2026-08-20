@@ -2300,5 +2300,418 @@ static enumError nkit_write_filler
 
 //
 ///////////////////////////////////////////////////////////////////////////////
+///////////	  FileSystem.cs -> nkit_parse_fst_wii()		///////////////
+///////////	  NkitFormat.cs:80-143 -> nkit_get_convert_fst_files()	///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// This is the prerequisite the stalled partitionStreamWrite() port (the
+// FST/file-loop driver, still not ported -- see this file's header) needs:
+// a real Wii FST tree walk producing FstFile-equivalent records, and the
+// GetConvertFstFiles() gap-derivation pass that turns those into the
+// ConvertFile list NkitWriteFileSystem() drives off of. Ported from
+// github.com/Nanook/NKitv1's NKit/FilesAndStreams/FileSystem.cs (whole
+// file, 190 lines) and NKit/Conversion/NkitFormat.cs:80-143
+// (GetConvertFstFiles()).
+//
+// Deliberately NOT reusing x-nkit.c's nkit_parse_fst_gc(): that function is
+// an intentionally reduced flat-offset parser (no tree, no names, no
+// OffsetInFstFile-as-shared-field semantics, no alignment/gap derivation)
+// built only for the small slice of GC restore work already ported there.
+// This is the real thing: it mirrors FileSystem.cs's FstFolder/FstFile
+// object graph and NkitFormat.cs's gap/alignment derivation faithfully.
+//
+// Deviation from the C#: FileSystem.Parse() builds an FstFolder/FstFile
+// object *tree*, then a separate Files getter (recurseFolders(), lines
+// 115-122) walks that tree to produce a flat, unsorted List<FstFile> --
+// unsorted because ordering never actually matters until the *caller*
+// re-sorts it (GetConvertFstFiles's OrderBy(Offset).ThenBy(Length) at
+// FileSystem.cs-caller line NkitFormat.cs:87, which entirely supersedes
+// whatever order Files produced). Since the object-tree round-trip changes
+// nothing observable, nkit_parse_fst_wii() below flattens directly during
+// the same recursive walk recurseFst() already does, instead of building a
+// tree and then re-walking it -- one pass, same result.
+//
+// Folder objects are still allocated (not skipped) because FstFile.Parent
+// is a real field of the ported struct (used by the C#'s Path property);
+// dropping it would mean guessing that no future caller needs it. Both the
+// folder pool and the file pool are sized to the FST's total entry count
+// up front (a file can never exceed one FST entry, same generous-upper-
+// -bound approach nkit_parse_fst_gc() already uses above) so folder/file
+// pointers stay stable for the whole walk -- no realloc-invalidation risk
+// for the Parent pointers threaded through recursion.
+
+// [[nkit_wii_fst_folder_t]]
+// Port of FstFolder (NkitFormat.cs:11-28). Folders.List<FstFolder> is not
+// kept (nothing here ever needs to enumerate a folder's children -- only
+// FstFile.Parent, for Path reconstruction, is used downstream) so this is
+// just the Name/Parent slice of the C# class.
+typedef struct nkit_wii_fst_folder_t
+{
+    const struct nkit_wii_fst_folder_t	*parent;	// FstFolder.Parent
+    ccp					name;		// FstFolder.Name (not owned: points into the fst.bin buffer)
+}
+nkit_wii_fst_folder_t;
+
+// [[nkit_wii_fst_file_t]]
+// Port of FstFile (NkitFormat.cs:65-104), full field set: PartitionId,
+// Parent, Name, DataOffset, (raw-partition) Offset, Length, IsNonFstFile,
+// OffsetInFstFile. FstFile.Clone() isn't ported -- every use here is by
+// value copy (plain struct assignment does the same thing in C, since none
+// of these fields are owned pointers).
+typedef struct nkit_wii_fst_file_t
+{
+    ccp					partition_id;	// FstFile.PartitionId (not owned)
+    const nkit_wii_fst_folder_t	*parent;	// FstFile.Parent
+    ccp					name;		// FstFile.Name (not owned: points into the fst.bin
+							// buffer for real entries, or a string literal for
+							// the synthetic "fst.bin" pseudo-entries below)
+    u64					data_offset;	// FstFile.DataOffset
+    u64					offset;		// FstFile.Offset: raw partition offset (post NStream.DataToOffset)
+    u64					length;		// FstFile.Length
+    bool				is_non_fst_file;// FstFile.IsNonFstFile
+    u32					offset_in_fst;	// FstFile.OffsetInFstFile: byte offset of this entry's
+							// data-offset field in the fst.bin buffer
+}
+nkit_wii_fst_file_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of NStream.DataToOffset(long o, bool isWii) -- NStream.cs:655-660.
+// Converts a "data stream" offset (hash blocks already stripped: 0x7c00
+// data bytes per 0x8000 on-disc sector) to the corresponding raw,
+// on-disc/hashed partition offset. For GC (isWii==false) it's the
+// identity -- same as the C#.
+static u64 nkit_data_to_offset ( u64 o, bool is_wii )
+{
+    if (!is_wii)
+	return o;
+    return (o / 0x7c00ull * 0x8000ull) + (o % 0x7c00ull) + 0x400ull;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of the private recurseFst(MemorySection ms, FstFolder folder, long
+// names, uint i, string id, bool isGc) -- FileSystem.cs:160-187. Standard
+// 12 byte FST entry parser (type<<24|nameOff, dataOffset, length), same
+// layout nkit_parse_fst_gc() above reads, but ported faithfully this time:
+// real names (shift-jis in the C#; treated here as raw bytes -- Wii/GC FST
+// names are ASCII in practice and nothing downstream decodes them, so no
+// codepage conversion is needed), a real folder tree via 'cur_folder', and
+// files appended directly into the flat output array (see the big comment
+// above on why that's equivalent to the C#'s build-tree-then-flatten).
+static enumError nkit_wii_fst_recurse
+(
+    const u8			*fst,		// MemorySection ms
+    u32				fst_size,
+    nkit_wii_fst_folder_t	*folder_pool,	// preallocated, n_entries slots
+    uint			*n_folder,	// in/out: folders used so far (slot 0 == root, preplaced by caller)
+    const nkit_wii_fst_folder_t	*cur_folder,	// 'folder' param
+    long			names,		// 'names' param: byte offset of the FST string table
+    uint			i,		// 'i' param
+    ccp				id,		// 'id' param
+    bool			is_gc,		// 'isGc' param
+    nkit_wii_fst_file_t		*file_pool,	// preallocated, n_entries slots
+    uint			*n_file,	// in/out: files used so far
+    uint			*out_i		// return value (next fst index)
+)
+{
+    if ( (u64)(i+1)*12 > fst_size )
+	return ERROR0(ERR_WIA_INVALID,"NKit: fst.bin entry index out of range\n");
+
+    u32 hdr  = be32(fst + 12*(u64)i);
+    long name = names + (long)( hdr & 0x00ffffffL );
+    int  type = (int)( hdr >> 24 );
+    ccp  nm   = name >= 0 && (u64)name < fst_size ? (ccp)(fst+name) : "";
+    u32  size = be32(fst + 12*(u64)i + 8);
+
+    if ( type == 1 ) // directory
+    {
+	const nkit_wii_fst_folder_t *f;
+	if ( i == 0 )
+	    f = cur_folder; // root: don't allocate, same as C#'s 'i==0 ? folder : new FstFolder(...)'
+	else
+	{
+	    nkit_wii_fst_folder_t *nf = folder_pool + (*n_folder)++;
+	    nf->parent = cur_folder;
+	    nf->name   = nm;
+	    f = nf;
+	}
+
+	uint j;
+	for ( j = i+1; j < size; )
+	{
+	    enumError err = nkit_wii_fst_recurse(fst,fst_size,folder_pool,n_folder,f,
+		names,j,id,is_gc,file_pool,n_file,&j);
+	    if (err)
+		return err;
+	}
+	*out_i = size;
+	return ERR_OK;
+    }
+    else // file
+    {
+	u32 pos  = 12*i + 4;
+	u64 doff = (u64)be32(fst+pos) * ( is_gc ? 1ull : 4ull ); // offset in data
+	size     = be32(fst + 12*(u64)i + 8);
+	u64 off  = nkit_data_to_offset(doff,!is_gc); // offset in raw partition
+
+	nkit_wii_fst_file_t *nfile = file_pool + (*n_file)++;
+	nfile->partition_id    = id;
+	nfile->parent          = cur_folder;
+	nfile->name            = nm;
+	nfile->data_offset     = doff;
+	nfile->offset          = off;
+	nfile->length          = size;
+	nfile->is_non_fst_file = false;
+	nfile->offset_in_fst   = pos;
+
+	*out_i = i+1;
+	return ERR_OK;
+    }
+}
+
+// Port of the internal FileSystem.Parse(MemorySection ms, FstFile fst,
+// string id, bool isGc) -- FileSystem.cs:146-158, called by
+// GetConvertFstFiles() (NkitFormat.cs:87) with fst==null, so the "synthetic
+// fst.bin entry gets prepended to the tree" branch never fires on that
+// path and isn't reachable from here; the two public FileSystem.Parse()
+// overloads that DO build that synthetic entry (byte[]/Stream-taking,
+// FileSystem.cs:127-139) aren't ported for the same reason -- nothing in
+// this codebase calls FileSystem.Parse() any other way yet.
+//
+// 'folder_pool'/'file_pool' are allocated here, sized to fst_size/12 (an
+// FST can't have more entries than that many 12 byte records) -- same
+// generous-upper-bound approach as nkit_parse_fst_gc(). Both are owned by
+// the caller on success: FREE() 'res_file' only after FREE()'ing
+// 'res_folder' (or after being done reading any FstFile.Name/Parent -- the
+// file entries' Parent pointers point into the folder pool).
+static enumError nkit_parse_fst_wii
+(
+    const u8			*fst,		// fst.bin buffer (MemorySection ms)
+    u32				fst_size,
+    ccp				id,
+    bool			is_gc,
+    nkit_wii_fst_folder_t	**res_folder,
+    uint			*res_n_folder,
+    nkit_wii_fst_file_t		**res_file,
+    uint			*res_n_file
+)
+{
+    if ( fst_size < 12 )
+	return ERROR0(ERR_WIA_INVALID,"NKit: fst.bin too small\n");
+
+    const u64 n_files = be32(fst+8); // ReadUInt32B(0x8): root entry's own 'size' field == entry count
+    if ( 12*n_files > fst_size )
+	return ERROR0(ERR_WIA_INVALID,"NKit: fst.bin entry count out of range\n");
+
+    nkit_wii_fst_folder_t *folder_pool = MALLOC(n_files*sizeof(*folder_pool));
+    nkit_wii_fst_file_t   *file_pool   = MALLOC(n_files*sizeof(*file_pool));
+    uint n_folder = 1, n_file = 0; // slot 0 preplaced as the root folder below
+
+    folder_pool[0].parent = 0;
+    folder_pool[0].name   = "";
+
+    uint end_i;
+    enumError err = nkit_wii_fst_recurse(fst,fst_size,folder_pool,&n_folder,folder_pool+0,
+	12*(long)n_files,0,id,is_gc,file_pool,&n_file,&end_i);
+    if (err)
+    {
+	FREE(folder_pool);
+	FREE(file_pool);
+	return err;
+    }
+
+    *res_folder   = folder_pool;
+    *res_n_folder = n_folder;
+    *res_file     = file_pool;
+    *res_n_file   = n_file;
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// [[nkit_wii_convert_file_t]]
+// Port of ConvertFile (NkitFormat.cs:30-63), the slice GetConvertFstFiles()
+// itself populates: FstFile (embedded by value here rather than
+// referenced, see below), GapLength, and Alignment. Gap/IsJunk/NewSize
+// aren't populated by GetConvertFstFiles() -- they belong to the actual
+// restore write (NkitWriteFileSystem()/copyFile()/writeGap(), i.e. this
+// file's existing nkit_convert_file_t/nkit_copy_file()/nkit_write_gap())
+// which is a separate, later step to wire up (bridging this richer struct
+// into that narrower one, or widening that one, is stage 2b driver work --
+// out of scope here, "no caller yet" is expected).
+//
+// FstFile is embedded BY VALUE, not referenced, unlike the C# (List<
+// ConvertFile> sharing FstFile object references). In the C# each FstFile
+// is only ever wrapped by exactly one ConvertFile (the loop below always
+// pairs a "previous" FstFile with a fresh ConvertFile, never reuses one),
+// so there's no aliasing to preserve; embedding avoids extra allocations
+// and lifetime coupling to the pools nkit_parse_fst_wii() returns. The one
+// exception -- copyFile() mutating FstFile.Length in place for the
+// GapType.JunkFile case (NkitFormat.cs:54) -- mutates the ConvertFile's own
+// embedded copy either way, so behavior is unchanged.
+typedef struct nkit_wii_convert_file_t
+{
+    nkit_wii_fst_file_t	fst_file;	// ConvertFile.FstFile
+    u64			gap_length;	// ConvertFile.GapLength
+    s64			alignment;	// ConvertFile.Alignment: -1 = do not align, 0 = preserve, else explicit
+}
+nkit_wii_convert_file_t;
+
+// Port of the FstFile ordering used at NkitFormat.cs:87 --
+// '.OrderBy(a => a.Offset)?.ThenBy(a => a.Length)' -- a single (Offset,
+// Length) sort, not FileSystem.cs's separate Files-getter OrderBy(Offset)
+// (which this ThenBy-chained sort supersedes entirely; see the big comment
+// on nkit_parse_fst_wii() above).
+static int nkit_wii_fst_file_cmp ( const void *pa, const void *pb )
+{
+    const nkit_wii_fst_file_t *a = pa, *b = pb;
+    if ( a->offset != b->offset )
+	return a->offset < b->offset ? -1 : 1;
+    return a->length < b->length ? -1 : a->length > b->length ? 1 : 0;
+}
+
+// Port of NkitFormat.GetConvertFstFiles() -- NkitFormat.cs:80-143. Builds
+// the list of gap-annotated files NkitWriteFileSystem() (already ported
+// above as the existing per-file copy/gap machinery) drives its file loop
+// from. The C#'s 'inStream' parameter is unused in the method body (never
+// referenced) so it's dropped here; 'hdr' is only ever read at one fixed
+// field (FstOffset, hdr.ReadUInt32B(0x424)*mlt) which this codebase's Wii
+// partition header parser (nkit_part_header_init(), above) already
+// extracts into nkit_part_header_t.fst_offset, so that's taken directly as
+// 'fst_offset' instead of re-deriving it from a raw header buffer here.
+//
+// On the two "negative gap" conditions the C# soft-fails (returns null +
+// an out error string, letting the caller fall back to "convert as bad
+// image"); ported here as a hard enumError instead, matching every other
+// error path in this file -- there's no caller yet to decide a soft-fail
+// policy for, and this file doesn't have a soft-fail-with-message
+// convention anywhere else to extend.
+static enumError nkit_get_convert_fst_files
+(
+    const u8			*fst,			// MemorySection fst
+    u32				fst_size,
+    u64				fst_offset,		// nkit_part_header_t.fst_offset (see above)
+    ccp				partition_id,		// hdr.ReadString(0,4)
+    bool			is_gc,
+    s64				fst_file_alignment,	// fstFileAlignment: 0=preserve, -1=default(0x8000 heuristic), else explicit
+    u64				image_size,		// 'size' param
+    nkit_wii_fst_folder_t	**res_folder,		// owned; see nkit_parse_fst_wii()
+    uint			*res_n_folder,
+    nkit_wii_convert_file_t	**res_conv,		// owned
+    uint			*res_n_conv
+)
+{
+    *res_conv = 0;
+    *res_n_conv = 0;
+
+    nkit_wii_fst_folder_t *folder_pool;
+    nkit_wii_fst_file_t   *file_pool;
+    uint n_folder, n_file;
+    enumError err = nkit_parse_fst_wii(fst,fst_size,partition_id,is_gc,
+	&folder_pool,&n_folder,&file_pool,&n_file);
+    if (err)
+	return err;
+
+    if (!n_file)
+    {
+	FREE(folder_pool);
+	FREE(file_pool);
+	return ERROR0(ERR_WIA_INVALID,"NKit: fst.bin has no files\n");
+    }
+
+    qsort(file_pool,n_file,sizeof(*file_pool),nkit_wii_fst_file_cmp);
+
+    nkit_wii_convert_file_t *conv = MALLOC((n_file+1)*sizeof(*conv)); // +1: trailing "last file" entry, same shape as the C#'s List<>.Add() tail
+    uint n_conv = 0;
+
+    // Synthetic "fst.bin" pseudo-FstFile (NkitFormat.cs:92-93), used as the
+    // 'previous file' sentinel for i==0's gap derivation only -- note its
+    // Offset is set to fstLen directly, NOT run through
+    // nkit_data_to_offset() like every real file's Offset is; that
+    // asymmetry is in the original C# too (ff.Offset = fstLen, not
+    // NStream.DataToOffset(fstLen,...)) and is preserved here as-is.
+    nkit_wii_fst_file_t fst_pseudo = {0};
+    fst_pseudo.name            = "fst.bin";
+    fst_pseudo.data_offset     = fst_offset;
+    fst_pseudo.offset          = fst_offset;
+    fst_pseudo.length          = fst_size;
+    fst_pseudo.is_non_fst_file = true;
+
+    for ( uint i = 0; i < n_file; i++ )
+    {
+	const nkit_wii_fst_file_t *ff = i == 0 ? &fst_pseudo : &file_pool[i-1];
+
+	u64 end = ff->data_offset + ff->length;
+	end += end % 4 == 0 ? 0 : 4 - (end % 4);
+
+	if ( file_pool[i].data_offset < end ) // gap = srcFiles[i].DataOffset - end, checked < 0
+	{
+	    FREE(folder_pool);
+	    FREE(file_pool);
+	    FREE(conv);
+	    return ERROR0(ERR_WIA_INVALID,
+		"NKit: the gap between '%s' and '%s' is %lld - image is invalid\n",
+		ff->name,file_pool[i].name,(s64)(file_pool[i].data_offset-end));
+	}
+	u64 gap = file_pool[i].data_offset - end;
+
+	conv[n_conv].fst_file    = *ff;
+	conv[n_conv].gap_length  = gap;
+	n_conv++;
+    }
+
+    // trailing entry: gap between the last real file and the end of the image
+    {
+	const nkit_wii_fst_file_t *ff = &file_pool[n_file-1];
+	u64 end = ff->data_offset + ff->length;
+	end += end % 4 == 0 ? 0 : 4 - (end % 4);
+
+	s64 gap = (s64)image_size - (s64)end;
+	if ( gap >= -3 && gap < 0 )
+	    gap = 0; // some hacked GC images converted from TGC end on the file end (star fox e3)
+	if ( gap < 0 )
+	{
+	    FREE(folder_pool);
+	    FREE(file_pool);
+	    FREE(conv);
+	    return ERROR0(ERR_WIA_INVALID,
+		"NKit: the gap between '%s' and the end of the image is %lld - image/partition is invalid\n",
+		ff->name,gap);
+	}
+
+	conv[n_conv].fst_file   = *ff;
+	conv[n_conv].gap_length = (u64)gap;
+	n_conv++;
+    }
+
+    // set alignment -- NkitFormat.cs:124-135
+    static const ccp align_ext[] = { ".tgc" }; // only entry NKit itself still enables (rest commented out in the C#)
+    for ( uint i = 0; i < n_conv; i++ )
+    {
+	const nkit_wii_fst_file_t *ff = &conv[i].fst_file;
+	ccp dot = strrchr(ff->name,'.');
+
+	if ( fst_file_alignment == 0 )
+	    conv[i].alignment = 0; // preserve alignment
+	else if ( fst_file_alignment == -1 && ff->data_offset % 0x8000 == 0 &&
+	    ( ff->length % 0x8000 == 0 || ( dot && !strcasecmp(dot,align_ext[0]) ) ) )
+	    conv[i].alignment = 0x8000; // default behaviour
+	else if ( fst_file_alignment != 0 && ff->data_offset % fst_file_alignment == 0 ) // src matches alignment
+	    conv[i].alignment = fst_file_alignment; // align to largest multiple
+	else
+	    conv[i].alignment = -1; // do not align this file
+    }
+
+    FREE(file_pool); // conv[] embeds copies of every FstFile by value; the pool itself is no longer needed
+    *res_folder   = folder_pool;
+    *res_n_folder = n_folder;
+    *res_conv     = conv;
+    *res_n_conv   = n_conv;
+    return ERR_OK;
+}
+
+//
+///////////////////////////////////////////////////////////////////////////////
 ///////////////                          END                    ///////////////
 ///////////////////////////////////////////////////////////////////////////////
