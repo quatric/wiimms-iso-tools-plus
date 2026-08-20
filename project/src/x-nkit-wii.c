@@ -34,12 +34,15 @@
  *                                                                         *
  ***************************************************************************/
 
-// NKit (.nkit.iso) restoration -- Wii support types, STAGE 1 OF 3.
+// NKit (.nkit.iso) restoration -- Wii support types, STAGE 2a (of a driver
+// that still doesn't exist yet -- see below).
 //
 // This file is NOT a restore driver. There is no NkitRestoreWii() here and
 // nothing in this file is called from XCONVERT or anywhere else yet -- see
 // x-nkit.c's file header for the GC driver this will eventually sit next
 // to, and the ~750 line NkitReaderWii.cs this whole file is prep for.
+// XCONVERT still does not handle Wii NKit images after stage 2a; that is
+// stage 2b (the actual Read()/NkitRestoreWii() driver loop).
 //
 // What IS here: a faithful, field-for-field port of the 8 supporting C#
 // types NkitReaderWii.cs itself is built on top of (NkitReaderWii.cs was
@@ -987,6 +990,16 @@ typedef struct nkit_part_header_t
     bool		has_content_sha1;
     u64			fst_offset;	// FstOffset
     u64			fst_size;	// FstSize
+
+    // DecryptedScrubbed00/DecryptedScrubbedFF: what an all-0x00 (resp.
+    // all-0xFF) 16-byte encrypted block decrypts to under this partition's
+    // title key with IV==the same all-0x00/all-0xFF pattern -- i.e. what a
+    // properly *scrubbed* (junk-filled) sector's hash area looks like once
+    // decrypted. Computed once here (ctor tail, "decrypt scrubbed values"
+    // comment in the C#) and handed to nkit_scrub_manager_t below, which is
+    // the only consumer.
+    u8			decrypted_00[WII_KEY_SIZE];
+    u8			decrypted_ff[WII_KEY_SIZE];
 }
 nkit_part_header_t;
 
@@ -1063,6 +1076,21 @@ static enumError nkit_part_header_init ( nkit_part_header_t *ph, const u8 *data,
     // up the matching real common key via wd_get_common_key() internally.
     const wd_ticket_t *tik = (const wd_ticket_t *)data;
     wd_decrypt_title_key(tik,ph->key);
+
+    // "decrypt scrubbed values" tail of the C# ctor: decrypt one all-0xFF
+    // block with IV=all-0xFF, then one all-0x00 block with IV=all-0x00,
+    // both under this partition's title key. Only used by
+    // nkit_scrub_manager_t's IsScrubbed()-equivalent block comparisons.
+    aes_key_t akey;
+    wd_aes_set_key(&akey,ph->key);
+
+    u8 ff_block[WII_KEY_SIZE];
+    memset(ff_block,0xff,sizeof(ff_block));
+    wd_aes_decrypt(&akey,ff_block,ff_block,ph->decrypted_ff,WII_KEY_SIZE);
+
+    u8 zero_block[WII_KEY_SIZE];
+    memset(zero_block,0,sizeof(zero_block));
+    wd_aes_decrypt(&akey,zero_block,zero_block,ph->decrypted_00,WII_KEY_SIZE);
 
     return ERR_OK;
 }
@@ -1295,6 +1323,498 @@ static const u8 * nkit_hash_store_flags ( const nkit_hash_store_t *hs, uint *len
     return hs->flags;
 }
 
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////    ScrubManager.cs -> nkit_scrub_manager_t (STAGE 2a)    ///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// STAGE 2a of the Wii restore port. Everything above this point is stage 1
+// (bookkeeping/AES/hash-tree types, unused/uncalled). This section adds the
+// two pieces NkitReaderWii.cs itself needs that stage 1 didn't provide:
+// ScrubManager (below) and StreamCircularBuffer (further down). There is
+// STILL no NkitRestoreWii() and nothing here is wired into XCONVERT --
+// that's stage 2b. Ported from the real github.com/Nanook/NKitv1 source
+// (MIT-licensed), cross-checked against every call site in
+// NkitReaderWii.cs (grepped for ScrubManager/IsBlockScrubbedScanMode/
+// IsBlockScrubbed/AddGap/.Scrub()/StreamCircularBuffer).
+//
+// ScrubManager tracks which regions of a partition's *decrypted* data are
+// regenerable junk (all-0x00 or all-0xFF once decrypted -- see
+// nkit_part_header_t.decrypted_00/decrypted_ff above, which only exist
+// because this type needs them) versus real file data that must be
+// preserved byte-for-byte. The restore driver (stage 2b) will call
+// nkit_scrub_manager_scrub() while writing scrubbed gaps back out, then
+// nkit_scrub_manager_is_block_scrubbed_scan_mode() while re-encrypting/
+// re-hashing the partition sequentially forward, and
+// nkit_scrub_manager_add_gap() while it discovers trailing-null runs in
+// the H3 table's 28-byte-per-block pattern.
+//
+// Only the call sites actually reachable from NkitReaderWii.cs are ported:
+// IsScrubbed() (used only by the *writer*/image-creation side, per grep of
+// NkitWriterGc.cs/NkitWriterWii.cs) is intentionally NOT ported here -- do
+// not add it speculatively; if stage 2b turns out to need it after all,
+// port it then, straight off ScrubManager.cs:56-114 in the clone.
+
+// Direct port of the private nested 'ScrubRegion' class.
+typedef struct nkit_scrub_region_t
+{
+    u64		offset;		// Offset (already scaled to the *hashed*/on-disc
+				// 0x8000-per-block domain by add(), see below)
+    u64		length;		// Length
+    u8		byt;		// Byte
+}
+nkit_scrub_region_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Direct port of ScrubManager. C#'s Queue<ScrubRegion> _scrub (drained by
+// IsBlockScrubbedScanMode) and List<ScrubRegion> _cache (kept intact for
+// IsBlockScrubbed) are two views over the exact same append-only sequence
+// of regions -- add() enqueues into _scrub AND appends to _cache in the
+// same call, and nothing in the whole class ever removes a *_cache* entry.
+// Since this port is single-threaded (no concurrent producer/consumer
+// unlike the C# original -- see the StreamCircularBuffer notes below for
+// why that's fine here), one owned growable array replaces both: 'region'
+// holds every region ever added (== _cache), and 'scan_cursor' is the
+// "next to dequeue" index that IsBlockScrubbedScanMode advances (== _scrub
+// draining, but non-destructively so _cache semantics fall out for free).
+typedef struct nkit_scrub_manager_t
+{
+    nkit_scrub_region_t	*region;	// _cache (== also backs _scrub), owned, growable
+    uint		count;		// regions used
+    uint		capacity;	// regions allocated
+    uint		scan_cursor;	// index of the region IsBlockScrubbedScanMode
+					// will inspect next (mirrors _next after a
+					// Dequeue(); an index survives realloc, a
+					// C#-style pointer would not)
+    int			last_idx;	// index of _last, or -1 if none yet
+
+    bool		is_wii_partition; // _wiiPartition
+    const u8		*decrypted_00;	// _00.Decrypted: nkit_part_header_t.decrypted_00,
+					// NOT owned, NULL only if !is_wii_partition
+    const u8		*decrypted_ff;	// _FF.Decrypted: nkit_part_header_t.decrypted_ff
+
+    // H3Nulls: list of (offset, len) trailing-null runs AddGap() detects.
+    // The C# tuple's 3rd element (FstFile) is always passed null from every
+    // AddGap() call site reachable off the restore path (NkitReaderWii.cs's
+    // own writeGap() calls it with no file context) -- dropped here as a
+    // result; add it back only if a real caller is found that needs it.
+    struct { u64 offset; int len; } *h3_null;
+    uint		h3_null_count, h3_null_cap;
+}
+nkit_scrub_manager_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
+// ctor: ScrubManager() / ScrubManager(WiiPartitionHeaderSection header).
+// Pass header_decrypted_00/header_decrypted_ff both NULL for the "not a
+// Wii partition" (GC / non-encrypted) case -- matches ScrubManager(null),
+// e.g. NkitWriterGc.cs's plain ScrubManager() or NkitReaderWii.cs:51's
+// ScrubManager(null) "scrubFiller".
+static void nkit_scrub_manager_init ( nkit_scrub_manager_t *sm,
+    bool is_wii_partition, const u8 decrypted_00[WII_KEY_SIZE], const u8 decrypted_ff[WII_KEY_SIZE] )
+{
+    memset(sm,0,sizeof(*sm));
+    sm->last_idx = -1;
+    sm->is_wii_partition = is_wii_partition;
+    sm->decrypted_00 = is_wii_partition ? decrypted_00 : 0;
+    sm->decrypted_ff = is_wii_partition ? decrypted_ff : 0;
+}
+
+static void nkit_scrub_manager_reset_mem ( nkit_scrub_manager_t *sm )
+{
+    if (sm->region)  FREE(sm->region);
+    if (sm->h3_null) FREE(sm->h3_null);
+    memset(sm,0,sizeof(*sm));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// private add(long offset, long length, byte b) -- called from Scrub().
+// Rounds to the enclosing 0x7c00-byte (WII_SECTOR_DATA_SIZE) *data* block,
+// pads the length up to a block boundary, then rescales both from the
+// 0x7c00 data domain to the 0x8000 (WII_SECTOR_SIZE) on-disc/hashed
+// domain -- exactly like the C# (literal 0x7c00L/0x8000L there; named
+// constants here since this file already has them). Extends the previous
+// region in place if it's contiguous and the same fill byte, else appends
+// a new one.
+static void nkit_scrub_manager_add ( nkit_scrub_manager_t *sm, u64 offset, u64 length, u8 b )
+{
+    if ( offset % WII_SECTOR_DATA_SIZE )
+    {
+	length += offset % WII_SECTOR_DATA_SIZE;
+	offset -= offset % WII_SECTOR_DATA_SIZE;
+    }
+    if ( length % WII_SECTOR_DATA_SIZE )
+	length += WII_SECTOR_DATA_SIZE - length % WII_SECTOR_DATA_SIZE;
+
+    offset = offset / WII_SECTOR_DATA_SIZE * WII_SECTOR_SIZE;
+    length = length / WII_SECTOR_DATA_SIZE * WII_SECTOR_SIZE;
+
+    nkit_scrub_region_t *last = sm->last_idx >= 0 ? sm->region+sm->last_idx : 0;
+    if ( last && last->byt == b && offset >= last->offset && offset <= last->offset+last->length )
+    {
+	if ( offset+length > last->offset+last->length )
+	    last->length = offset+length - last->offset;
+	return;
+    }
+
+    if ( sm->count == sm->capacity )
+    {
+	sm->capacity = sm->capacity ? sm->capacity*2 : 64;
+	sm->region = REALLOC(sm->region,sm->capacity*sizeof(*sm->region));
+    }
+    nkit_scrub_region_t *r = sm->region + sm->count;
+    r->offset = offset;
+    r->length = length;
+    r->byt    = b;
+    sm->last_idx = sm->count;
+    sm->count++;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Scrub(Stream stream, long partitionDataOffset, long size, byte scrubByte):
+// write 'size' bytes of the scrub pattern for 'scrubByte' to the write
+// callback, and (Wii-partition case only) record the region via add().
+//
+// The C# streams through a ByteStream (Zeros/Fives/FFs, or _00/_FF for the
+// Wii-partition decrypted-pattern case) via Utils.Copy()'s double-buffered
+// 0x200000-byte pump. There's no Stream to hand a pattern-generator to in
+// C, so 'write' is called directly with successive chunks of a stack
+// buffer filled from the pattern -- same bytes, same order, just produced
+// eagerly into 'write' instead of read lazily off a fake Stream.
+typedef enumError (*nkit_write_func) ( void *ctx, const u8 *data, u32 size );
+
+static enumError nkit_scrub_manager_scrub ( nkit_scrub_manager_t *sm,
+    nkit_write_func write, void *ctx, u64 partition_data_offset, u64 size, u8 scrub_byte )
+{
+    if (sm->is_wii_partition)
+    {
+	if ( scrub_byte != 0x00 && scrub_byte != 0xff )
+	    return ERROR0(ERR_WIA_INVALID,
+		"NKit: Wii partition scrubbing does not support byte 0x%02x\n",scrub_byte);
+	nkit_scrub_manager_add(sm,partition_data_offset,size,scrub_byte);
+    }
+
+    const u8 *pat = 0;		// non-NULL: 16-byte repeating decrypted pattern (Wii case)
+    if (sm->is_wii_partition)
+	pat = scrub_byte == 0x00 ? sm->decrypted_00 : sm->decrypted_ff;
+
+    enum { CHUNK = 0x200000 };	// Utils.Copy()'s buffer size
+    u8 buf[CHUNK];
+    if (!pat)
+	memset(buf,scrub_byte,sizeof(buf));
+
+    while (size)
+    {
+	u32 n = (u32)( size < CHUNK ? size : CHUNK );
+	if (pat)
+	{
+	    // 16-byte repeating decrypted pattern, not necessarily
+	    // buffer-aligned to 16 -- matches ByteStream.Read()'s running
+	    // 'x' index (here always starting at 0 since Scrub() always
+	    // begins each call at a fresh chunk of the pattern stream, the
+	    // same way ByteStream's Position tracks continuously across
+	    // calls but WII_KEY_SIZE-periodic content makes any 16-aligned
+	    // start equivalent).
+	    for ( u32 i = 0; i < n; i++ )
+		buf[i] = pat[i % WII_KEY_SIZE];
+	}
+	enumError err = write(ctx,buf,n);
+	if (err)
+	    return err;
+	size -= n;
+    }
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// AddGap(long fileLength, long gapOffset, long gapLength): record a
+// trailing run of nulls inside the H3 table's 28-byte-per-0x7c00-block
+// pattern (H3 entries are 20 bytes of hash + 8 bytes padding = 28 used out
+// of some larger stride -- see the original for the exact derivation this
+// mirrors verbatim).
+static void nkit_scrub_manager_add_gap ( nkit_scrub_manager_t *sm, u64 file_length, u64 gap_offset, u64 gap_length )
+{
+    u64 s = (gap_offset + 28) % WII_SECTOR_DATA_SIZE;
+
+    if ( file_length == 0 )
+    {
+	if ( sm->h3_null_count == sm->h3_null_cap )
+	{
+	    sm->h3_null_cap = sm->h3_null_cap ? sm->h3_null_cap*2 : 16;
+	    sm->h3_null = REALLOC(sm->h3_null,sm->h3_null_cap*sizeof(*sm->h3_null));
+	}
+	sm->h3_null[sm->h3_null_count].offset = gap_offset;
+	sm->h3_null[sm->h3_null_count].len    = (int)( gap_length < 28 ? gap_length : 28 );
+	sm->h3_null_count++;
+    }
+    else if ( s <= 28 && gap_length - (28-s) >= WII_SECTOR_DATA_SIZE ) // nulls spill to next block and length > block
+    {
+	if ( sm->h3_null_count == sm->h3_null_cap )
+	{
+	    sm->h3_null_cap = sm->h3_null_cap ? sm->h3_null_cap*2 : 16;
+	    sm->h3_null = REALLOC(sm->h3_null,sm->h3_null_cap*sizeof(*sm->h3_null));
+	}
+	sm->h3_null[sm->h3_null_count].offset = gap_offset + (28-s);
+	sm->h3_null[sm->h3_null_count].len    = (int)s;
+	sm->h3_null_count++;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// private isBlockScrubbed(ScrubRegion, offset, out scrubByte)
+static bool nkit_scrub_manager_region_hit ( const nkit_scrub_region_t *r, u64 offset, u8 *scrub_byte )
+{
+    *scrub_byte = 0;
+    if ( r && offset >= r->offset && offset < r->offset+r->length )
+    {
+	*scrub_byte = r->byt;
+	return true;
+    }
+    return false;
+}
+
+// IsBlockScrubbedScanMode(long offset, out byte scrubByte): forward-only
+// scan -- advances scan_cursor past any region whose range has already
+// been left behind, exactly like the C# dequeuing a new _next once the old
+// one's range no longer covers 'offset'.
+static bool nkit_scrub_manager_is_block_scrubbed_scan_mode ( nkit_scrub_manager_t *sm, u64 offset, u8 *scrub_byte )
+{
+    nkit_scrub_region_t *next = sm->scan_cursor < sm->count ? sm->region+sm->scan_cursor : 0;
+    if ( !next || next->offset+next->length < offset )
+    {
+	if ( sm->scan_cursor < sm->count )
+	    sm->scan_cursor++;
+	next = sm->scan_cursor < sm->count ? sm->region+sm->scan_cursor : 0;
+    }
+    return nkit_scrub_manager_region_hit(next,offset,scrub_byte);
+}
+
+// IsBlockScrubbed(long offset, out byte scrubByte): full linear scan of
+// every region ever added, order-independent (first match wins, same as
+// the C# foreach).
+static bool nkit_scrub_manager_is_block_scrubbed ( const nkit_scrub_manager_t *sm, u64 offset, u8 *scrub_byte )
+{
+    *scrub_byte = 0;
+    for ( uint i = 0; i < sm->count; i++ )
+	if ( nkit_scrub_manager_region_hit(sm->region+i,offset,scrub_byte) )
+	    return true;
+    return false;
+}
+
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////  StreamCircularBuffer.cs -> nkit_circular_buffer_t (STAGE 2a) ///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// NkitReaderWii.cs uses StreamCircularBuffer exactly once (around line 126
+// of the clone): it hands a *writer callback* -- partitionStreamWrite(),
+// which walks a partition's files/gaps/junk and pushes decrypted bytes
+// forward -- to a background Task, and reads the result back out through
+// the Stream interface on the calling (main) thread, while the writer
+// Task races ahead filling the ring and blocking (Monitor.Wait) whenever
+// it gets more than one buffer's worth of lead. The buffer's whole reason
+// to exist in C# is to let those two loops run on separate OS threads
+// without needing (size-of-partition) memory: the reader can pull data as
+// slowly as its own destination I/O allows while the producer keeps
+// generating in the background.
+//
+// This codebase (x-nkit.c's GC path, lib-wia.c's RVZ reader, and every
+// other reader/writer here) has no equivalent background-thread pattern
+// anywhere -- everything is one synchronous call stack, one FILE* at a
+// time. Introducing real OS threads here for this one call site would be
+// a bigger behavioral change than a "port", and isn't needed: nothing
+// about partitionStreamWrite()'s *output bytes* depends on it running
+// concurrently with the reader -- concurrency there is a C# performance
+// detail (I/O overlap), not part of what makes restored output correct.
+//
+// So this port keeps the ring-buffer *data structure* (fixed-capacity
+// byte ring, monotonic read/write position counters, the forward-only
+// Seek() skip-ahead trick used by SeekToFile()) but drops the threading:
+// nkit_circular_buffer_write()/_read() are plain, non-blocking,
+// same-thread cursor operations. Where C#'s Write() would block
+// (Monitor.Wait) until the reader drains room, this port's write simply
+// copies as much as currently fits and returns the short count -- it is
+// the stage 2b driver's job to interleave "call write with whatever's
+// left" and "call read to drain" in one synchronous loop, the same way
+// every other staged-I/O loop in this codebase (e.g. x-nkit.c's
+// nkit_decode_gap()) already pumps a fixed buffer forward. That is a
+// faithful behavioral equivalent of the C# for a single-threaded caller:
+// the *sequence and byte content* the reader ends up seeing is identical
+// (same ring math, same seek-discard rule below), only the scheduling
+// (background thread vs. explicit caller-driven steps) differs, and nkit
+// restoration has no external concurrency requirement to preserve.
+//
+// IProgress.Value (float read-progress getter, cosmetic UI only) and the
+// Dispose()-time "wait for writer thread to actually exit, then close the
+// wrapped source stream" teardown are both artifacts of the threaded
+// design and are NOT ported -- there is no background thread to wait for,
+// and the source stream lifetime is the stage 2b driver's job.
+typedef struct nkit_circular_buffer_t
+{
+    u8		*buf;		// _b, owned
+    u32		capacity;	// sizeof(*buf) allocated (caller-chosen; C# used a
+				// fixed, oversized-for-double-buffering 0x500000)
+    u32		r, w;		// _r, _w: byte cursors into buf, each 0..capacity-1
+
+    u64		size;		// _size: total expected stream length, 0 == unbounded
+    u64		r_position;	// _rPosition: total bytes handed out via read() so far
+    u64		w_position;	// _wPosition: total bytes accepted via write() so far
+    s64		seek_position;	// _seekPosition: -1 == not mid-seek
+    bool	writing_complete; // _writingComplete
+}
+nkit_circular_buffer_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
+// ctor: StreamCircularBuffer(long size, Stream stream, IDisposable dispose,
+// Action<Stream> write). Only 'size' (-1 -> unbounded here, since there's
+// no wrapped source Stream.Length to default to) and the ring capacity
+// carry over; 'stream'/'dispose'/'write' were background-thread plumbing,
+// see the file-header note above for why they're not ported.
+static void nkit_circular_buffer_init ( nkit_circular_buffer_t *cb, u64 size, u32 capacity )
+{
+    memset(cb,0,sizeof(*cb));
+    cb->buf = MALLOC(capacity);
+    cb->capacity = capacity;
+    cb->size = size;
+    cb->seek_position = -1;
+}
+
+static void nkit_circular_buffer_reset_mem ( nkit_circular_buffer_t *cb )
+{
+    if (cb->buf) FREE(cb->buf);
+    memset(cb,0,sizeof(*cb));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Write(byte[] buffer, int offset, int count), minus the Monitor.Wait
+// blocking (see file-header note): copies as many of 'count' bytes as
+// currently fit, handling the forward-seek discard exactly like the C#
+// (bytes written while (_seekPosition != -1 && _wPosition < _seekPosition)
+// are silently dropped/counted rather than buffered, until w_position
+// catches up to seek_position, at which point both cursors are reset to
+// that position and normal ring writes resume). Returns the number of
+// bytes actually consumed from 'data' (may be less than 'size' if the
+// ring is full -- caller must nkit_circular_buffer_read() to drain and
+// call again with the remainder, same as the interleaving note above).
+static u32 nkit_circular_buffer_write ( nkit_circular_buffer_t *cb, const u8 *data, u32 size )
+{
+    if ( cb->writing_complete || ( cb->size && cb->w_position >= cb->size ) )
+	return 0; // matches C#'s early return once the reader is done
+
+    u32 total = size;
+
+    if ( cb->seek_position != -1 && cb->w_position < (u64)cb->seek_position )
+    {
+	u64 c64 = (u64)cb->seek_position - cb->w_position;
+	u32 c = (u32)( c64 < size ? c64 : size );
+	cb->w_position += c;
+	data += c;
+	size -= c;
+
+	if ( cb->w_position == (u64)cb->seek_position )
+	{
+	    cb->r_position = cb->seek_position;
+	    cb->w = cb->r = (u32)( cb->r_position % cb->capacity );
+	    cb->seek_position = -1;
+	}
+	else
+	    return total; // still seeking past the end of this chunk; "consumed" it all
+    }
+
+    if ( cb->seek_position == -1 && size )
+    {
+	// avail-to-write in the ring, same wrap arithmetic as C#'s 'l'
+	s32 l = (s32)cb->r - (s32)cb->w;
+	if ( l < 0 || ( l == 0 && cb->w_position == cb->r_position ) )
+	    l = (s32)( cb->capacity - cb->w + cb->r ); // buffer empty -> full capacity available
+
+	u32 n  = (u32)l < size ? (u32)l : size;
+	u32 n1 = cb->capacity - cb->w < n ? cb->capacity - cb->w : n;
+
+	memcpy(cb->buf+cb->w,data,n1);
+	cb->w = cb->w+n1 == cb->capacity ? 0 : cb->w+n1;
+
+	if ( n != n1 )
+	{
+	    memcpy(cb->buf+cb->w,data+n1,n-n1);
+	    cb->w += n-n1;
+	}
+	cb->w_position += n;
+	size -= n;
+    }
+
+    return total - size;
+}
+
+// Read(byte[] buffer, int offset, int count), minus the Monitor.Wait
+// blocking: copies as many of 'count' bytes as currently available.
+// Returns 0 once writing_complete and nothing left buffered, exactly
+// where C#'s loop condition (!_writingComplete || _rPosition<_wPosition)
+// would fall through without ever pausing.
+static u32 nkit_circular_buffer_read ( nkit_circular_buffer_t *cb, u8 *data, u32 size )
+{
+    if ( cb->seek_position != -1 ) // mid-seek: nothing to hand out yet
+	return 0;
+    if ( !( !cb->writing_complete || cb->r_position < cb->w_position ) )
+	return 0;
+
+    s32 l = (s32)cb->w - (s32)cb->r;
+    if ( l < 0 || ( l == 0 && cb->r_position < cb->w_position ) )
+	l = (s32)( cb->capacity - cb->r + cb->w );
+
+    u32 n  = (u32)l < size ? (u32)l : size;
+    u32 n1 = cb->capacity - cb->r < n ? cb->capacity - cb->r : n;
+
+    memcpy(data,cb->buf+cb->r,n1);
+    cb->r = cb->r+n1 == cb->capacity ? 0 : cb->r+n1;
+
+    if ( n != n1 )
+    {
+	memcpy(data+n1,cb->buf+cb->r,n-n1);
+	cb->r += n-n1;
+    }
+    cb->r_position += n;
+
+    return n;
+}
+
+// Seek(long offset, SeekOrigin.Begin only -- the only origin any call site
+// uses). Forward-only, same as the C# (backward seek throws
+// NotImplementedException there; this port reports it the wit way).
+static enumError nkit_circular_buffer_seek ( nkit_circular_buffer_t *cb, u64 pos )
+{
+    if ( pos < cb->r_position )
+	return ERROR0(ERR_INTERNAL,"NKit: circular buffer only supports forward seek\n");
+    if ( pos == cb->r_position )
+	return ERR_OK;
+
+    if ( cb->w_position > pos ) // already buffered -- just move the read cursor
+    {
+	cb->r_position = pos;
+	cb->r = (u32)( cb->r_position % cb->capacity );
+    }
+    else
+	cb->seek_position = (s64)pos; // not there yet: writer-side must catch up and discard
+
+    return ERR_OK;
+}
+
+// mirrors the writer Task's ContinueWith() flipping _writingComplete once
+// the producer (stage 2b's synchronous equivalent of partitionStreamWrite)
+// has no more bytes to offer.
+static void nkit_circular_buffer_mark_write_done ( nkit_circular_buffer_t *cb )
+{
+    cb->writing_complete = true;
+}
+
+//
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////                          END                    ///////////////
 ///////////////////////////////////////////////////////////////////////////////
