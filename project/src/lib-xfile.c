@@ -63,6 +63,7 @@ const xformat_info_t xformat_info[XF__N] =
     { XF_CIA,	"CIA",	".cia", "3DS installable title",	1,0,0 },
     { XF_XCI,	"XCI",	".xci", "Switch cartridge image",	1,0,0 },
     { XF_NSP,	"NSP",	".nsp", "Switch package",		1,0,0 },
+    { XF_NKIT_GC, "NKIT", ".iso", "NKit-compressed GC image (restore only)", 0,0,1 },
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -153,6 +154,16 @@ xformat_t AnalyzeXFormat
 
     if ( data_size >= 0x160 && le16(d+0x15c) == 0xcf56 )
 	return XF_NDS;
+
+    //--- NKit
+    // "NKIT v01" tag stashed in the disc header's own unused 0x200 region --
+    // see x-nkit.c. Only the GC restore path is implemented so far; a Wii
+    // .nkit.iso is still recognized here (so XCONVERT reports a clear
+    // "not implemented" instead of "unknown container"), XExtractNKitGC()
+    // itself is what actually rejects the Wii case.
+
+    if ( data_size >= 0x208 && !memcmp(d+0x200,"NKIT v01",8) )
+	return XF_NKIT_GC;
 
     (void)file_size;
     return XF_UNKNOWN;
@@ -315,6 +326,16 @@ enumError XConvert ( ccp source, ccp dest, xformat_t format )
     if ( src_format == XF_UNKNOWN )
 	return ERROR0(ERR_WRONG_FILE_TYPE,
 		"Not a supported container: %s\n",source);
+
+    // NKit restoration is one-directional (compressed -> plain disc image)
+    // and its output is a normal GC/Wii ISO, which -- unlike every other
+    // XCONVERT target -- has no xformat_info entry of its own (SuperFile_t
+    // owns plain disc images; see the file header comment in lib-xfile.h).
+    // So this bypasses the format_by_ext()/can_convert table lookup below
+    // entirely rather than trying to force a destination format that
+    // doesn't exist in this subsystem.
+    if ( src_format == XF_NKIT_GC )
+	return XExtractNKitGC(source,dest);
 
     if ( format == XF_UNKNOWN )
 	format = format_by_ext(dest);
