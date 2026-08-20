@@ -55,8 +55,8 @@ const xformat_info_t xformat_info[XF__N] =
 {
     { XF_UNKNOWN, "-",	 "",	 "unknown container",		0,0,0 },
 
-    { XF_WUD,	"WUD",	".wud", "Wii U disc image",		0,0,1 },
-    { XF_WUX,	"WUX",	".wux", "Wii U disc image, sparse",	0,0,1 },
+    { XF_WUD,	"WUD",	".wud", "Wii U disc image",		1,0,1 },
+    { XF_WUX,	"WUX",	".wux", "Wii U disc image, sparse",	1,0,1 },
     { XF_NDS,	"NDS",	".nds", "Nintendo DS/DSi cartridge",	1,1,0 },
     { XF_WAD,	"WAD",	".wad", "installable Wii title",	1,1,0 },
     { XF_CCI,	"CCI",	".3ds", "3DS cartridge image",		1,0,0 },
@@ -265,6 +265,8 @@ enumError XExtract ( ccp source, ccp dest )
 
     switch (fform)
     {
+	case XF_WUD:
+	case XF_WUX:	return XExtractWiiU(source,fform,dest);
 	case XF_NDS:	return XExtractNDS(source,dest);
 	case XF_WAD:	return XExtractWAD(source,dest);
 	case XF_CCI:	return XExtractCCI(source,dest);

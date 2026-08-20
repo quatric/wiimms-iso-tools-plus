@@ -55,6 +55,7 @@
 enumError XInfoWiiU    ( ccp source, xformat_t format );
 enumError XConvertWiiU ( ccp source, xformat_t src_format,
 			 ccp dest,   xformat_t dest_format );
+enumError XExtractWiiU ( ccp source, xformat_t format, ccp dest );
 
 //--- Nintendo DS (x-nds.c)
 
