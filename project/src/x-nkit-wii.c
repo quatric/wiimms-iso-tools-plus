@@ -1137,26 +1137,171 @@ static void nkit_partition_seek_to_file ( nkit_partition_t *p, u64 file_offset )
 
 //
 ///////////////////////////////////////////////////////////////////////////////
-///////////  WiiPartitionGroupSection.cs -> nkit_group_t (bookkeeping)	///////////
+///////////  WiiPartitionGroupSection.cs -> nkit_group_t			///////////
 ///////////////////////////////////////////////////////////////////////////////
 
-// Bookkeeping-only port of WiiPartitionGroupSection: wraps one
-// nkit_group_crypt_t with the group's position within its partition
-// (Offset/DataOffset/H3Errors) and exposes the same PreserveHashes()
-// decision the C# makes (used by the -- not yet ported -- unscrub pass to
-// decide whether a group's hashes need to be carried in the .nkit.iso
-// stream verbatim instead of being regenerable from junk).
+// Direct port of WiiPartitionGroupSection: wraps one nkit_group_crypt_t with
+// the group's position within its partition (Offset/DataOffset/H3Errors),
+// the same PreserveHashes() decision the C# makes (used by the -- not yet
+// ported -- unscrub pass to decide whether a group's hashes need to be
+// carried in the .nkit.iso stream verbatim instead of being regenerable
+// from junk), and now (see nkit_group_init()/nkit_group_populate() below)
+// the actual crypto/hash-tree behavior: Populate(), MarkBlockDirty(),
+// SetScrubbed(), IsValid(), ForceHashes() and the Encrypted/Decrypted
+// buffer-view accessors, all thin wrappers delegating into the already
+// fully-ported nkit_group_crypt_t.
 typedef struct nkit_group_t
 {
-    nkit_group_crypt_t	crypt;		// _data
-    int			idx;		// _idx: group index within the partition
-    u64			offset;		// Offset = idx * max_length
-    u64			data_offset;	// DataOffset = idx * WII_GROUP_SECTORS * WII_SECTOR_DATA_SIZE
-    uint		h3_errors;	// H3Errors
-    bool		is_encrypted;	// IsEncrypted
-    bool		is_iso_dec;	// _isIsoDec
+    nkit_group_crypt_t		crypt;		// _data
+    const nkit_part_header_t	*part_hdr;	// _partHdr, NOT owned (Header property)
+    int				idx;		// _idx: group index within the partition
+    u64				offset;		// Offset = idx * max_length
+    u64				data_offset;	// DataOffset = idx * WII_GROUP_SECTORS * WII_SECTOR_DATA_SIZE
+    u64				disc_offset;	// base.DiscOffset
+    u64				size;		// base.Size
+    uint			h3_errors;	// H3Errors
+    bool			is_encrypted;	// IsEncrypted
+    bool			is_iso_dec;	// _isIsoDec
 }
 nkit_group_t;
+
+///////////////////////////////////////////////////////////////////////////////
+
+// initialise(): private helper called from both the ctor and Populate() --
+// recomputes the group's byte position within its partition from _idx.
+static void nkit_group_initialise_pos ( nkit_group_t *g )
+{
+    g->offset = (u64)g->idx * NKIT_PARTITION_GROUP_SIZE;			// Offset = _idx * _maxLength
+    g->data_offset = (u64)g->idx * WII_GROUP_SECTORS * WII_SECTOR_DATA_SIZE;	// DataOffset = _idx * 64 * 0x7c00
+    g->h3_errors = 0;
+}
+
+// Populate(int groupIdx, byte[] data, long discOffset, long size): re-point
+// this group at a different group index/data -- also the tail half of the
+// ctor below, shared here as one function like the C# shares it via the
+// ctor calling _data.Populate()+initialise() directly.
+//
+// 'data_size' is the length of the 'data' buffer (byte[].Length in the C#,
+// which nkit_group_crypt_populate's own Math.Min(size,data.Length) needs --
+// our nkit_group_crypt_populate takes an already-clamped size, so the clamp
+// happens here instead, one call site up, exactly where the C# performs it).
+static void nkit_group_populate
+(
+    nkit_group_t	*g,
+    int			group_idx,
+    const u8		*data,
+    uint		data_size,
+    u64			disc_offset,
+    u64			size
+)
+{
+    g->disc_offset = disc_offset;	// base.DiscOffset = discOffset
+    g->size = size;			// base.Size = size
+    g->idx = group_idx;		// _idx = groupIdx
+
+    uint s = (uint)( size < data_size ? size : data_size );	// Math.Min(size, data.Length)
+    if ( s > g->crypt.max_size )
+	s = g->crypt.max_size;
+
+    nkit_group_crypt_populate(&g->crypt,data,s,g->is_encrypted && !g->is_iso_dec,g->is_iso_dec,group_idx);
+
+    nkit_group_initialise_pos(g);
+}
+
+// ctor: WiiPartitionGroupSection(NStream stream, WiiDiscHeaderSection hdr,
+//                                 WiiPartitionHeaderSection partHdr, byte[] data,
+//                                 long discOffset, long size, bool encrypted)
+//
+// 'is_iso_dec' is hdr.IsIsoDecPartition(partHdr.DiscOffset) -- no
+// WiiDiscHeaderSection equivalent exists in this port yet, so (matching the
+// pattern already used elsewhere in this file for not-yet-ported inputs,
+// e.g. nkit_filler_t's flags) the caller is expected to supply it already
+// computed, rather than inventing the lookup here.
+static enumError nkit_group_init
+(
+    nkit_group_t		*g,
+    const nkit_part_header_t	*part_hdr,	// partHdr: supplies Key + H3Table
+    const u8			*data,
+    uint			data_size,
+    u64				disc_offset,
+    u64				size,
+    bool			encrypted,
+    bool			is_iso_dec
+)
+{
+    memset(g,0,sizeof(*g));
+    g->part_hdr = part_hdr;
+    g->is_iso_dec = is_iso_dec;
+
+    enumError err = nkit_group_crypt_init(&g->crypt,NKIT_PARTITION_GROUP_SIZE,part_hdr->key,part_hdr->h3_table);
+    if (err)
+	return err;
+
+    // this.IsEncrypted = encrypted || !data.Equals(0x26c, new byte[20], 0, 20);
+    // i.e. true unless the caller says it's decrypted AND the H1-table
+    // padding area (which is always zero in a decrypted group) really is
+    // all zero.
+    bool padding_zero = data_size >= 0x26c+20;
+    if (padding_zero)
+	for ( uint i = 0; i < 20 && padding_zero; i++ )
+	    if ( data[0x26c+i] )
+		padding_zero = false;
+    g->is_encrypted = encrypted || !padding_zero;
+
+    // this.Junk = new byte[WiiPartitionSection.GroupSize]; _unscrubValid = new bool[64];
+    // -- both belong to the not-yet-ported Unscrub()/JunkStream path, so
+    // deliberately omitted here (nothing else in this task's method list
+    // reads them).
+
+    nkit_group_populate(g,0,data,data_size,disc_offset,size);	// _idx = 0 initially
+    return ERR_OK;
+}
+
+static void nkit_group_reset_mem ( nkit_group_t *g )
+{
+    nkit_group_crypt_reset_mem(&g->crypt);
+    memset(g,0,sizeof(*g));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// MarkBlockDirty(int blockIndex)
+static void nkit_group_mark_block_dirty ( nkit_group_t *g, int block_index )
+{
+    nkit_group_crypt_mark_dirty(&g->crypt,(uint)block_index);
+}
+
+// SetScrubbed(int blockIndex, byte scrubByte)
+static void nkit_group_set_scrubbed ( nkit_group_t *g, int block_index, u8 scrub_byte )
+{
+    nkit_group_crypt_mark_scrubbed(&g->crypt,(uint)block_index,scrub_byte);
+}
+
+// IsValid(bool calculateHashes)
+static bool nkit_group_is_valid ( nkit_group_t *g, bool calculate_hashes )
+{
+    return nkit_group_crypt_is_valid(&g->crypt,calculate_hashes);
+}
+
+// ForceHashes(byte[] hashes)
+static void nkit_group_force_hashes ( nkit_group_t *g, const u8 *hashes /* nullable */ )
+{
+    nkit_group_crypt_force_hashes(&g->crypt,hashes);
+}
+
+// Encrypted { get { return _data.Encrypted; } }
+static u8 * nkit_group_encrypted ( nkit_group_t *g )
+{
+    return nkit_group_crypt_ensure_encrypted(&g->crypt);
+}
+
+// Decrypted { get { return _data.Decrypted; } }
+static u8 * nkit_group_decrypted ( nkit_group_t *g )
+{
+    return nkit_group_crypt_ensure_decrypted(&g->crypt);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 // PreserveHashes(): true if this group's hash area can't be trusted to
 // regenerate byte-identically from junk alone and must be preserved
