@@ -490,12 +490,31 @@ static enumError dump_ncch
     {
 	if (fixed_key)
 	{
-	    // Fixed-crypto NCCH (system archives) use a publicly documented
-	    // constant key rather than a per-title one; not applicable to
-	    // retail game content, so it is left unhandled here.
-	    ERROR0(ERR_WARNING,
-		"NCCH uses the fixed-crypto key, which is not implemented;"
-		" exefs/romfs will not be decrypted: %s\n",label);
+	    // Fixed-crypto NCCH: the per-title KeyX/KeyY scramble is skipped
+	    // entirely in favour of one of two small, publicly documented
+	    // constants (3dbrew "NCCH" -> "Cryptography", FixedCryptoKey):
+	    //   - ordinary titles: an all-zero 128 bit AES key.
+	    //   - "System" category titles: a separate fixed constant, chosen
+	    //     via the Program ID's category bit (bit 0x10 of the high
+	    //     32 bits, per 3dbrew).  That second constant is not
+	    //     implemented here -- rather than guess an unverified byte
+	    //     value, System-category fixed-key NCCH content is skipped
+	    //     with an explicit warning; only the zero-key case (which
+	    //     needs no lookup at all) is decrypted.
+	    const u32 program_id_hi = le32(ncch+NCCH_OFF_PROGRAM_ID+4);
+	    const bool is_system = (program_id_hi & 0x10) != 0;
+	    if (is_system)
+	    {
+		ERROR0(ERR_WARNING,
+		    "NCCH uses the System FixedCryptoKey, which is not"
+		    " implemented (only the all-zero FixedCryptoKey is);"
+		    " exefs/romfs will not be decrypted: %s\n",label);
+	    }
+	    else
+	    {
+		memset(normal_key,0,sizeof(normal_key));
+		use_key = normal_key;
+	    }
 	}
 	else if (seed_crypto)
 	{
