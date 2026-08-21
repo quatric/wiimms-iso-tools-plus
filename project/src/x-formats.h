@@ -69,9 +69,10 @@ enumError XInfoWAD     ( ccp source );
 enumError XExtractWAD  ( ccp source, ccp dest );
 enumError XCreateWAD   ( ccp source, ccp dest );
 
-//--- NKit (x-nkit.c) -- GameCube restore only, see x-nkit.c's header comment
+//--- NKit restore: GameCube (x-nkit.c) and Wii (x-nkit-wii.c)
 
-enumError XExtractNKitGC ( ccp source, ccp dest );
+enumError XExtractNKitGC  ( ccp source, ccp dest );
+enumError XExtractNKitWii ( ccp source, ccp dest );
 
 //--- 3DS: CCI cartridges and CIA titles (x-3ds.c)
 

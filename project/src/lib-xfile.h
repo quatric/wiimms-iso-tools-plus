@@ -72,6 +72,7 @@ typedef enum xformat_t
     XF_XCI,		// Switch cartridge dump
     XF_NSP,		// Switch package (PFS0)
     XF_NKIT_GC,		// NKit-compressed GameCube disc image (.nkit.iso); see x-nkit.c
+    XF_NKIT_WII,	// NKit-compressed Wii disc image (.nkit.iso); see x-nkit-wii.c
 
     XF__N		// number of formats
 }

@@ -34,19 +34,25 @@
  *                                                                         *
  ***************************************************************************/
 
-// NKit (.nkit.iso) restoration -- Wii support types, STAGE 2a (of a driver
-// that still doesn't exist yet -- see below).
+// NKit (.nkit.iso) restoration -- the Wii path, complete.
 //
-// This file is NOT a restore driver. There is no NkitRestoreWii() here and
-// nothing in this file is called from XCONVERT or anywhere else yet -- see
-// x-nkit.c's file header for the GC driver this will eventually sit next
-// to, and the ~750 line NkitReaderWii.cs this whole file is prep for.
-// XCONVERT still does not handle Wii NKit images after stage 2a; that is
-// stage 2b (the actual Read()/NkitRestoreWii() driver loop).
+// XCONVERT dispatches Wii NKit images here via XExtractNKitWii() (the last
+// function in this file, a port of NkitReaderWii.Read()); lib-xfile.c picks
+// between this and x-nkit.c's GameCube driver by disc magic.
 //
-// What IS here: a faithful, field-for-field port of the 8 supporting C#
-// types NkitReaderWii.cs itself is built on top of (NkitReaderWii.cs was
-// deliberately NOT read/ported -- that's stage 2/3), from the real
+// VERIFIED byte exact, not merely plausible: the driver checks the finished
+// image's CRC32 against the CRC32 NKit stored in the header, and both local
+// Redump-sourced samples restore to an exact match --
+//
+//   Super Fruit Fall (Europe)  RF4P6M  crc32 854b0feb
+//   Ninjabread Man (USA)       RNME5Z  crc32 250d18e5
+//
+// -- with `wit VERIFY` reporting +OK on the UPDATE and DATA partitions of
+// both, independently re-deriving the H0-H3 tree and the ticket/TMD
+// signatures.
+//
+// The file is built bottom-up: first a faithful, field-for-field port of the
+// supporting C# types NkitReaderWii.cs is built on top of, from the real
 // github.com/Nanook/NKitv1 source:
 //
 //   WiiPartitionGroupEncryptionState.cs -> nkit_group_crypt_t   (the AES-128-CBC
@@ -94,6 +100,17 @@
 // the "fast hash valid" short-circuit -- because wit's own VERIFY/EXTRACT
 // pipeline never needed to *mutate* a group and re-derive its hashes
 // on demand the way NKit's restore path does.
+//
+// Two deviations from the C# are structural rather than incidental, and both
+// are documented at length where they live:
+//
+//   * the producer/consumer StreamCircularBuffer between
+//     partitionStreamWrite() and Read()'s group loop is spooled through a
+//     temp file instead of two threads (wit links no pthread) -- see
+//     nkit_circular_buffer_set_spool();
+//   * an image whose update partition was removed at conversion time is
+//     rejected up front, because restoring it needs NKit's external recovery
+//     store, which has no equivalent here -- see XExtractNKitWii()'s header.
 
 #define _GNU_SOURCE 1
 
@@ -1114,8 +1131,8 @@ static void nkit_part_header_reset_mem ( nkit_part_header_t *ph )
 // Bookkeeping-only port of WiiPartitionSection: which group is "current",
 // the running source-stream position, and the deferred seek-to-file offset
 // NkitReaderWii.cs's SeekToFile()/Sections iterator drive. Does not itself
-// perform any I/O yet -- no NStream equivalent exists in wit's C code, and
-// building one is squarely stage 2/3 territory (the actual restore driver).
+// perform any I/O -- no NStream equivalent exists in wit's C code; the
+// restore driver at the end of this file does its own I/O directly.
 typedef struct nkit_partition_t
 {
     nkit_part_header_t	header;		// Header
@@ -1142,8 +1159,8 @@ static void nkit_partition_seek_to_file ( nkit_partition_t *p, u64 file_offset )
 
 // Direct port of WiiPartitionGroupSection: wraps one nkit_group_crypt_t with
 // the group's position within its partition (Offset/DataOffset/H3Errors),
-// the same PreserveHashes() decision the C# makes (used by the -- not yet
-// ported -- unscrub pass to decide whether a group's hashes need to be
+// the same PreserveHashes() decision the C# makes (used by the writer-side
+// unscrub pass to decide whether a group's hashes need to be
 // carried in the .nkit.iso stream verbatim instead of being regenerable
 // from junk), and now (see nkit_group_init()/nkit_group_populate() below)
 // the actual crypto/hash-tree behavior: Populate(), MarkBlockDirty(),
@@ -1472,15 +1489,12 @@ static const u8 * nkit_hash_store_flags ( const nkit_hash_store_t *hs, uint *len
 
 //
 ///////////////////////////////////////////////////////////////////////////////
-///////////////    ScrubManager.cs -> nkit_scrub_manager_t (STAGE 2a)    ///////////////
+///////////////        ScrubManager.cs -> nkit_scrub_manager_t         ///////////////
 ///////////////////////////////////////////////////////////////////////////////
 
-// STAGE 2a of the Wii restore port. Everything above this point is stage 1
-// (bookkeeping/AES/hash-tree types, unused/uncalled). This section adds the
-// two pieces NkitReaderWii.cs itself needs that stage 1 didn't provide:
-// ScrubManager (below) and StreamCircularBuffer (further down). There is
-// STILL no NkitRestoreWii() and nothing here is wired into XCONVERT --
-// that's stage 2b. Ported from the real github.com/Nanook/NKitv1 source
+// The two pieces NkitReaderWii.cs needs that the bookkeeping/AES/hash-tree
+// types above don't provide: ScrubManager (below) and StreamCircularBuffer
+// (further down). Ported from the real github.com/Nanook/NKitv1 source
 // (MIT-licensed), cross-checked against every call site in
 // NkitReaderWii.cs (grepped for ScrubManager/IsBlockScrubbedScanMode/
 // IsBlockScrubbed/AddGap/.Scrub()/StreamCircularBuffer).
@@ -1489,7 +1503,7 @@ static const u8 * nkit_hash_store_flags ( const nkit_hash_store_t *hs, uint *len
 // regenerable junk (all-0x00 or all-0xFF once decrypted -- see
 // nkit_part_header_t.decrypted_00/decrypted_ff above, which only exist
 // because this type needs them) versus real file data that must be
-// preserved byte-for-byte. The restore driver (stage 2b) will call
+// preserved byte-for-byte. The restore driver calls
 // nkit_scrub_manager_scrub() while writing scrubbed gaps back out, then
 // nkit_scrub_manager_is_block_scrubbed_scan_mode() while re-encrypting/
 // re-hashing the partition sequentially forward, and
@@ -1499,8 +1513,8 @@ static const u8 * nkit_hash_store_flags ( const nkit_hash_store_t *hs, uint *len
 // Only the call sites actually reachable from NkitReaderWii.cs are ported:
 // IsScrubbed() (used only by the *writer*/image-creation side, per grep of
 // NkitWriterGc.cs/NkitWriterWii.cs) is intentionally NOT ported here -- do
-// not add it speculatively; if stage 2b turns out to need it after all,
-// port it then, straight off ScrubManager.cs:56-114 in the clone.
+// not add it speculatively -- the finished restore driver never needed it.
+// If a future caller does, port it then, straight off ScrubManager.cs:56-114.
 
 // Direct port of the private nested 'ScrubRegion' class.
 typedef struct nkit_scrub_region_t
@@ -1755,7 +1769,7 @@ static bool nkit_scrub_manager_is_block_scrubbed ( const nkit_scrub_manager_t *s
 
 //
 ///////////////////////////////////////////////////////////////////////////////
-///////////////  StreamCircularBuffer.cs -> nkit_circular_buffer_t (STAGE 2a) ///////////////
+///////////////  StreamCircularBuffer.cs -> nkit_circular_buffer_t  ///////////////
 ///////////////////////////////////////////////////////////////////////////////
 
 // NkitReaderWii.cs uses StreamCircularBuffer exactly once (around line 126
@@ -1786,7 +1800,7 @@ static bool nkit_scrub_manager_is_block_scrubbed ( const nkit_scrub_manager_t *s
 // same-thread cursor operations. Where C#'s Write() would block
 // (Monitor.Wait) until the reader drains room, this port's write simply
 // copies as much as currently fits and returns the short count -- it is
-// the stage 2b driver's job to interleave "call write with whatever's
+// the driver's job to interleave "call write with whatever's
 // left" and "call read to drain" in one synchronous loop, the same way
 // every other staged-I/O loop in this codebase (e.g. x-nkit.c's
 // nkit_decode_gap()) already pumps a fixed buffer forward. That is a
@@ -1800,7 +1814,7 @@ static bool nkit_scrub_manager_is_block_scrubbed ( const nkit_scrub_manager_t *s
 // Dispose()-time "wait for writer thread to actually exit, then close the
 // wrapped source stream" teardown are both artifacts of the threaded
 // design and are NOT ported -- there is no background thread to wait for,
-// and the source stream lifetime is the stage 2b driver's job.
+// and the source stream lifetime is the driver's job.
 typedef struct nkit_circular_buffer_t
 {
     u8		*buf;		// _b, owned
@@ -1813,8 +1827,58 @@ typedef struct nkit_circular_buffer_t
     u64		w_position;	// _wPosition: total bytes accepted via write() so far
     s64		seek_position;	// _seekPosition: -1 == not mid-seek
     bool	writing_complete; // _writingComplete
+
+    // Spool mode (see the long note below): when non-NULL, this buffer is a
+    // plain sequential FIFO backed by a temp file instead of a ring, and
+    // 'buf'/'r'/'w'/'capacity' go unused. r_position/w_position keep their
+    // exact meaning either way.
+    FILE	*spool;
+
+    // Sink mode: when non-NULL, writes are forwarded straight to the
+    // restored output file (and its running CRC) and nothing is buffered at
+    // all. Read() passes 'crcStream' -- the real output -- as the target of
+    // its two writeFiller() calls (NkitReaderWii.cs:107 and :268), rather
+    // than the per-partition producer buffer, so those calls need a target
+    // that IS the output. Nothing ever reads back from a buffer in this mode.
+    struct nkit_out_t *sink;
 }
 nkit_circular_buffer_t;
+
+// defined further down, with the rest of the Read() driver
+static enumError nkit_out_write ( struct nkit_out_t *o, const void *data, u64 size );
+
+// WHY SPOOL MODE EXISTS
+//
+// The C# pairs partitionStreamWrite() (producer) with Read()'s group loop
+// (consumer) across two OS threads, with this ring buffer between them and
+// Monitor.Wait() on both sides. The consumer pulls 0x7c00 at a time to
+// assemble a 64-sector group; the producer pushes a whole partition's
+// decrypted data stream. Neither side can be expressed as a resumable step
+// without either real threads or a coroutine: partitionStreamWrite() is one
+// deep, monolithic call stack (FST walk -> per-file copy/gap/junk writes),
+// exactly as ported above.
+//
+// wit links no pthread for the 'wit' target (only wfuse does -- see the
+// Makefile's TOPT_wfuse) and has no background-thread pattern anywhere in
+// its reader/writer code, so introducing threads here for one call site
+// would be a build- and architecture-level change well beyond a port.
+//
+// Instead the producer runs to completion first, spooling its output to a
+// temp file, and the consumer then reads that file back sequentially. The
+// byte stream the consumer sees is bit-identical to what the threaded
+// version delivers -- the ordering contract between the two loops is purely
+// sequential FIFO, and nothing in partitionStreamWrite() reads any state the
+// consumer mutates. Only the scheduling (and a partition-sized temp file
+// instead of a 5 MiB ring) differs.
+//
+// It also removes a real race the C# has: Read() calls hashes.IsPreserved()
+// on the consumer side while WriteFlagsData() populates that same flags
+// buffer on the producer side. Running the producer first makes that
+// strictly ordered.
+static void nkit_circular_buffer_set_spool ( nkit_circular_buffer_t *cb, FILE *spool )
+{
+    cb->spool = spool;
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -1852,6 +1916,22 @@ static void nkit_circular_buffer_reset_mem ( nkit_circular_buffer_t *cb )
 // call again with the remainder, same as the interleaving note above).
 static u32 nkit_circular_buffer_write ( nkit_circular_buffer_t *cb, const u8 *data, u32 size )
 {
+    if (cb->sink)	// straight to the restored output, nothing buffered
+    {
+	if (nkit_out_write(cb->sink,data,size))
+	    return 0;
+	cb->w_position += size;
+	return size;
+    }
+
+    if (cb->spool)	// sequential FIFO: always accepts everything
+    {
+	if ( size && fwrite(data,1,size,cb->spool) != size )
+	    return 0;
+	cb->w_position += size;
+	return size;
+    }
+
     if ( cb->writing_complete || ( cb->size && cb->w_position >= cb->size ) )
 	return 0; // matches C#'s early return once the reader is done
 
@@ -1907,6 +1987,17 @@ static u32 nkit_circular_buffer_write ( nkit_circular_buffer_t *cb, const u8 *da
 // would fall through without ever pausing.
 static u32 nkit_circular_buffer_read ( nkit_circular_buffer_t *cb, u8 *data, u32 size )
 {
+    if (cb->spool)
+    {
+	u64 avail = cb->w_position - cb->r_position;
+	if ( size > avail )
+	    size = (u32)avail;
+	if ( size && fread(data,1,size,cb->spool) != size )
+	    return 0;
+	cb->r_position += size;
+	return size;
+    }
+
     if ( cb->seek_position != -1 ) // mid-seek: nothing to hand out yet
 	return 0;
     if ( !( !cb->writing_complete || cb->r_position < cb->w_position ) )
@@ -1954,7 +2045,7 @@ static enumError nkit_circular_buffer_seek ( nkit_circular_buffer_t *cb, u64 pos
 }
 
 // mirrors the writer Task's ContinueWith() flipping _writingComplete once
-// the producer (stage 2b's synchronous equivalent of partitionStreamWrite)
+// the producer (this port's synchronous equivalent of partitionStreamWrite)
 // has no more bytes to offer.
 static void nkit_circular_buffer_mark_write_done ( nkit_circular_buffer_t *cb )
 {
@@ -1963,17 +2054,13 @@ static void nkit_circular_buffer_mark_write_done ( nkit_circular_buffer_t *cb )
 
 //
 ///////////////////////////////////////////////////////////////////////////////
-///////////////  copyFile/writeGap/writeFiller (STAGE 2b, part 1)     ///////////////
+///////////////       copyFile / writeGap / writeFiller             ///////////////
 ///////////////////////////////////////////////////////////////////////////////
 
-// STAGE 2b (part 1) of the Wii restore port: NkitReaderWii.cs's copyFile()
-// (line 572), writeGap() (both overloads, lines 596 and 614) and
-// writeFiller() (line 606). These are the three low-level restore
-// primitives partitionRead()'s per-file loop calls once per FST file; that
-// loop itself (patchGroups/hashPatchGroup/fstPatch, the outer Read(), and
-// XCONVERT dispatch) is explicitly OUT of scope here -- see the file header
-// of the task that added this section. As a direct result, nothing below
-// has a caller yet; that is expected, same as stage 1/2a.
+// NkitReaderWii.cs's copyFile() (line 572), writeGap() (both overloads,
+// lines 596 and 614) and writeFiller() (line 606): the three low-level
+// restore primitives partitionStreamWrite()'s per-file loop calls once per
+// FST file, plus the filler writes the outer Read() loop makes directly.
 //
 // Stream roles, ported 1:1 from the C# parameter names:
 //   Stream inStream -> FILE *in_stream   (the raw source .nkit file, read-only)
@@ -1991,9 +2078,9 @@ static void nkit_circular_buffer_mark_write_done ( nkit_circular_buffer_t *cb )
 //                        state and is NOT exposed across translation units,
 //                        so this file takes it as an injected callback
 //                        instead of duplicating/porting JunkStream.cs here.
-//                        Wiring an actual Wii JunkStream equivalent through
-//                        this callback is stage 2b's driver's job.
-//   ScrubManager scrub -> nkit_scrub_manager_t *scrub (STAGE 2a, above)
+//                        The Wii JunkStream equivalent wired through this
+//                        callback is nkit_wii_junk_t, further down.
+//   ScrubManager scrub -> nkit_scrub_manager_t *scrub (above)
 
 // Gap/block record format, ported from Gaps.cs's GapType/GapBlockType enums
 // and Gap.BlockSize. This mirrors x-nkit.c's nkit_gap_type_t/
@@ -2048,7 +2135,9 @@ nkit_convert_file_t;
 // own comment); this port has no background reader to wait on yet, so a
 // short write here (the ring genuinely full) is reported as an error rather
 // than spun on -- interleaving writes with reads so the ring never actually
-// fills is stage 2b driver's job, same as noted on nkit_circular_buffer_t.
+// fills is the driver's job, same as noted on nkit_circular_buffer_t. In
+// practice the driver uses spool or sink mode, where a write never comes up
+// short, so this error is a guard rather than a live path.
 static enumError nkit_cb_write_all ( nkit_circular_buffer_t *target, const u8 *data, u32 size )
 {
     while (size)
@@ -2684,8 +2773,8 @@ static enumError nkit_parse_fst_wii
 // restore write (NkitWriteFileSystem()/copyFile()/writeGap(), i.e. this
 // file's existing nkit_convert_file_t/nkit_copy_file()/nkit_write_gap())
 // which is a separate, later step to wire up (bridging this richer struct
-// into that narrower one, or widening that one, is stage 2b driver work --
-// out of scope here, "no caller yet" is expected).
+// bridged into that narrower one by nkit_partition_stream_write()'s file
+// loop, which builds a nkit_convert_file_t per entry on the fly).
 //
 // FstFile is embedded BY VALUE, not referenced, unlike the C# (List<
 // ConvertFile> sharing FstFile object references). In the C# each FstFile
@@ -2730,9 +2819,8 @@ static int nkit_wii_fst_file_cmp ( const void *pa, const void *pb )
 // On the two "negative gap" conditions the C# soft-fails (returns null +
 // an out error string, letting the caller fall back to "convert as bad
 // image"); ported here as a hard enumError instead, matching every other
-// error path in this file -- there's no caller yet to decide a soft-fail
-// policy for, and this file doesn't have a soft-fail-with-message
-// convention anywhere else to extend.
+// error path in this file. Neither local sample exercises the soft-fail
+// branch, and this file has no soft-fail-with-message convention to extend.
 static enumError nkit_get_convert_fst_files
 (
     const u8			*fst,			// MemorySection fst
@@ -2908,20 +2996,46 @@ static enumError nkit_hash_store_write_flags_data
 // x-nkit.c's nkit_junk_t/nkit_seed_block()/nkit_junk_get() for the algorithm
 // commentary (a10002710()'s LFG-seed derivation, the regenerate-count note,
 // etc.) -- it is not repeated here.
+//
+// One field here has NO counterpart in x-nkit.c's GC nkit_junk_t: 'junk_length'.
+// JunkStream's ctor computes _junkLength = Math2.Align(_length,0x8000) from its
+// third ('length') argument, and fillBlock()'s tail (JunkStream.cs:287-289)
+// then ZEROES every byte of the generated 0x40000 block at or beyond that
+// length:
+//	int junkSize = Clamp(0, _junkLength - blk*buffer.Length, buffer.Length);
+//	if (buffer.Length - junkSize != 0) Array.Clear(buffer, junkSize, ...);
+// Since _junkLength is itself 0x8000 aligned, that is exactly equivalent to
+// "any byte at absolute position >= junk_length reads as 0x00", which is how
+// it's implemented below (per byte, rather than per 256 KiB block, so the
+// 0x8000-granular generator here doesn't need JunkStream's 0x40000 buffering).
+//
+// This is load bearing, not a cosmetic detail: NkitReaderWii.Read() constructs
+// its filler JunkStream with length '0' whenever the preceding partition was
+// the update partition (lines 107 and 267-268, 'lastPartitionType ==
+// PartitionType.Update ? 0 : imageSize'), and length 0 means junk_length 0
+// means the whole filler run is NULs rather than LFG output. Dropping this
+// field would silently emit megabytes of junk where the real disc has zeros.
 typedef struct nkit_wii_junk_t
 {
     u8		id[4];
     u8		disc;
+    u64		junk_length;	// _junkLength = Math2.Align(_length,0x8000)
     lfg_t	lfg;
     u64		block_start;
     bool	valid;
 }
 nkit_wii_junk_t;
 
-static void nkit_wii_junk_init ( nkit_wii_junk_t *nj, const u8 id[4], u8 disc )
+// ctor: JunkStream(byte[] id, int disc, long length)
+static void nkit_wii_junk_init ( nkit_wii_junk_t *nj, const u8 id[4], u8 disc, u64 length )
 {
     memcpy(nj->id,id,4);
     nj->disc  = disc;
+    // Math2.Align(val,boundry) is 'val / boundry * boundry' (NKit/Utils.cs:39),
+    // i.e. it rounds DOWN. A trailing partial 0x8000 block therefore has no
+    // junk generated for it at all -- fillBlock() only ever seeds whole
+    // 0x8000 sub-blocks -- and reads back as NULs.
+    nj->junk_length = length / 0x8000 * 0x8000;
     nj->valid = false;
 }
 
@@ -2967,6 +3081,14 @@ static void nkit_wii_junk_get ( nkit_wii_junk_t *nj, u64 pos, void *dest, u32 si
     u8 *out = dest;
     while (size)
     {
+	// fillBlock()'s trailing Array.Clear(): everything at or past
+	// _junkLength is zero, never generator output (see the type comment).
+	if ( pos >= nj->junk_length )
+	{
+	    memset(out,0,size);
+	    return;
+	}
+
 	const u64 block32k    = pos / 0x8000;
 	const u64 block_start = block32k * 0x8000;
 
@@ -2977,7 +3099,9 @@ static void nkit_wii_junk_get ( nkit_wii_junk_t *nj, u64 pos, void *dest, u32 si
 	if ( nj->lfg.pos == 0 && off_in_block != 0 )
 	    ForwardLFG(&nj->lfg,(u32)off_in_block);
 
-	const u64 avail = 0x8000 - off_in_block;
+	u64 avail = 0x8000 - off_in_block;
+	if ( avail > nj->junk_length - pos )	// stop generating at _junkLength;
+	    avail = nj->junk_length - pos;	// the tail is zeroed by the branch above
 	const u32 chunk = size < avail ? size : (u32)avail;
 	GetBytesLFG(&nj->lfg,out,chunk);
 
@@ -3048,12 +3172,11 @@ static enumError nkit_stream_skip ( FILE *in_stream, u64 bytes )
 
 // Subset of NkitPartitionPatchInfo (a plain field bag defined inline in
 // NkitReaderWii.Read(), not its own .cs file) that partitionStreamWrite()
-// itself reads or writes: ScrubManager (read-only here, already STAGE 2a's
-// nkit_scrub_manager_t) and PartitionDataHeader/Fst (write-only stashes for
-// the not-yet-ported hashPatchGroup/fstPatch machinery further down
-// NkitReaderWii.Read() to consume later). HashGroups/DiscOffset/
-// PartitionHeader belong to that same outer Read() loop and aren't needed by
-// this function, so they're not duplicated here -- same reasoning as
+// itself reads or writes: ScrubManager (read-only here) and
+// PartitionDataHeader/Fst (write-only stashes that hashPatchGroup()/
+// fstPatch() further down consume later). HashGroups/DiscOffset/
+// PartitionHeader belong to the outer Read() loop and live in the full
+// nkit_patch_info_t down there, which embeds this struct -- same reasoning as
 // nkit_convert_file_t only carrying the fields copyFile()/writeGap() touch.
 typedef struct nkit_partition_patch_info_t
 {
@@ -3078,7 +3201,7 @@ nkit_partition_patch_info_t;
 ///////////////  NkitReaderWii.cs:439-570 -> nkit_partition_stream_write()  ///////////////
 ///////////////////////////////////////////////////////////////////////////////
 
-// STAGE 2b (part 2) of the Wii restore port: partitionStreamWrite(), the
+// partitionStreamWrite(), the
 // per-partition restore driver NkitReaderWii.Read()'s foreach(WiiPartitionInfo
 // part in hdr.Partitions) loop calls once per partition (via a
 // StreamCircularBuffer producer callback -- NkitReaderWii.cs:130). It reads
@@ -3086,8 +3209,7 @@ nkit_partition_patch_info_t;
 // single all-gap/all-scrubbed region (header starts with 4 NUL bytes) or
 // walks the partition's FST -- via nkit_get_convert_fst_files(), the
 // gap-derivation pass ported above -- copying/gapping/fillering every real
-// file's data through copyFile()/writeGap() (both already ported, STAGE 2b
-// part 1).
+// file's data through copyFile()/writeGap().
 //
 // Parameters dropped versus the C#, per this task's scope:
 //   Stream inStream        -> FILE *in_stream (same convention as every
@@ -3171,8 +3293,9 @@ static enumError nkit_partition_stream_write
 	image_size = (u64)be32(szb) * 4;
 	*out_size = image_size / 0x8000ull * 0x7c00ull + image_size % 0x8000ull; // NStream.HashedLenToData()
 
+	// JunkStream(hdr.Read(0,4), hdr.Read8(6), outSize.Value) -- NkitReaderWii.cs:465
 	nkit_wii_junk_t junk;
-	nkit_wii_junk_init(&junk,hdr,hdr[6]);
+	nkit_wii_junk_init(&junk,hdr,hdr[6],*out_size);
 
 	u64 gap_out;
 	err = nkit_write_gap_core(&file_length,&gap_length,&nulls_pos,&src_pos,out_pos,
@@ -3264,8 +3387,9 @@ static enumError nkit_partition_stream_write
     // NkitReaderWii.cs:525
     conv[0].gap_length -= hashes->flags_size;
 
+    // JunkStream(hdr.Read(0,4), hdr.Read8(6), imageSize) -- NkitReaderWii.cs:478
     nkit_wii_junk_t junk;
-    nkit_wii_junk_init(&junk,hdr,hdr[6]);
+    nkit_wii_junk_init(&junk,hdr,hdr[6],image_size);
 
     bool first_file = true;
     for ( uint i = 0; i < n_conv; i++ )
@@ -3387,8 +3511,8 @@ typedef struct nkit_crc_item_t
 }
 nkit_crc_item_t;
 
-// ToString() (NCrc.cs:18-21) -- not ported: no caller yet (debug/log-only
-// in the original; add if/when the Read() port needs it).
+// ToString() (NCrc.cs:18-21) -- not ported: debug/log-only in the original,
+// and the finished Read() port never needed it.
 
 static void nkit_crc_item_reset_mem ( nkit_crc_item_t *it )
 {
@@ -3435,7 +3559,7 @@ nkit_crc_t;
 static void nkit_crc_init ( nkit_crc_t *c )
 {
     memset(c,0,sizeof(*c));
-    c->value      = 0xFFFFFFFF; // Crc._KInitial, applied by Crc..ctor()->Initialize()
+    c->value      = 0;	// see nkit_crc_update(): 'value' is the FINISHED CRC form
     c->need_reset = true;
 }
 
@@ -3458,7 +3582,8 @@ static void nkit_crc_reset_segment ( nkit_crc_t *c )
     if (c->need_reset)
     {
 	c->start_pos  = c->count;
-	c->value      = 0xFFFFFFFF; // base.Initialize()
+	c->value      = 0;	// base.Initialize() (_value = _KInitial), expressed
+				// in the finished form CalcCRC32() uses: ~0 == 0xFFFFFFFF
 	c->need_reset = false;
     }
 }
@@ -3478,6 +3603,13 @@ static void nkit_crc_update ( nkit_crc_t *c, const u8 *data, u32 size )
 {
     nkit_crc_reset_segment(c);
     c->count += size;
+    // CalcCRC32() (dclib/dclib-numeric.c:1434) does 'crc = ~crc' on entry and
+    // 'return ~crc' on exit, i.e. it consumes and produces the FINISHED
+    // (already inverted) CRC, not C#'s raw internal Crc._value. So 'c->value'
+    // holds the finished form throughout: it starts at 0 (whose inverse,
+    // 0xFFFFFFFF, is Crc._KInitial), chains directly across chunks, and needs
+    // no further inversion when snapshotted -- unlike C#, where _value is raw
+    // and the Value getter applies the '~'.
     c->value = CalcCRC32(c->value,data,size); // base.HashCore(data,offset,count)
 }
 
@@ -3502,10 +3634,10 @@ static void nkit_crc_snapshot ( nkit_crc_t *c, const char *name )
     memset(it,0,sizeof(*it));
     it->offset = c->start_pos;
     it->length = c->count - c->start_pos;
-    it->value  = ~c->value; // base.Value getter (NCrc.cs:50 reads `base.Value`,
-			     // which is Crc.cs:61-64's `~_value` getter -- so
-			     // this is the finished, inverted CRC, matching
-			     // what Combine()/FullCrc() below expect)
+    it->value  = c->value;  // NCrc.cs:50 reads `base.Value`, i.e. Crc.cs:61-64's
+			     // `~_value` -- the finished, inverted CRC. c->value
+			     // is already in exactly that form (see nkit_crc_update),
+			     // so no '~' is applied here.
     it->name   = STRDUP(name);
     c->n_crcs++;
 
@@ -3632,6 +3764,1025 @@ static u32 nkit_crc_at ( const nkit_crc_t *c, u64 position )
 	if ( c->crcs[i].offset == position )
 	    return c->crcs[i].value;
     return 0;
+}
+
+//
+///////////////////////////////////////////////////////////////////////////////
+///////////////   NkitReaderWii.cs:28-437 -> XExtractNKitWii()	///////////////
+///////////////////////////////////////////////////////////////////////////////
+
+// The outer restore driver: a port of NkitReaderWii.Read() (lines 28-299)
+// plus its three private helpers repairBlocks() (301), patchGroups() (312),
+// hashPatchGroup() (349) and fstPatch() (369), wiring together every
+// supporting type ported above into the function XCONVERT actually calls.
+//
+// C# orchestration NOT literally ported, and why:
+//
+//   Coordinator pc  -- the C# reader/writer rendezvous object. Its three
+//	checkpoint calls only exist to hand results to a *separate* writer
+//	running on another thread (Processor.cs pairs an IReader with an
+//	IWriter through a second StreamCircularBuffer). Here the "writer" is
+//	just fwrite() to the destination file, so the checkpoints collapse
+//	into ordinary control flow and the final validation is done inline --
+//	substantively equivalent: the restored image's CRC is still checked
+//	against the CRC embedded in the NKit header before success is
+//	reported, which is the one externally visible thing those checkpoints
+//	accomplish on this path.
+//
+//   pc.SetReaderException(...)  -- replaced throughout by this file's
+//	existing ERROR0()/ERROR1() + enumError convention.
+//
+//   Processor.cs:162-174's post-run patch pass IS ported (it is not
+//	orchestration -- it is what actually puts the corrected disc header,
+//	the FST with restored file offsets, and the preserved hash areas into
+//	the output file). It runs at the end of this function.
+//
+//   RecoveryData.GetUpdatePartition() (line 81) -- looks up an external
+//	*_<crc8>.bin update-partition blob in NKit's own settings/recovery
+//	directory, which this codebase has no equivalent of and no way to
+//	populate. An image whose update partition was removed at conversion
+//	time (updatePartitionCrc != 0) therefore cannot be restored
+//	byte-exactly here, and is rejected up front with a clear message
+//	rather than silently producing a filler-padded image that fails its
+//	own CRC check. Images that kept their update partition -- the norm
+//	for Redump-sourced .nkit -- are unaffected.
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Output sink: every restored byte goes through here so the running NCrc
+// sees exactly the stream that lands in the file (C#'s 'crcStream', a
+// CryptoStream wrapping outStream over the NCrc).
+struct nkit_out_t
+{
+    FILE	*f;
+    nkit_crc_t	*crc;
+    ccp		fname;
+};
+typedef struct nkit_out_t nkit_out_t;
+
+static enumError nkit_out_write ( nkit_out_t *o, const void *data, u64 size )
+{
+    if (!size)
+	return ERR_OK;
+    if ( fwrite(data,1,size,o->f) != size )
+	return ERROR1(ERR_WRITE_FAILED,"Write failed: %s\n",o->fname);
+    nkit_crc_update(o->crc,data,(u32)size);
+    return ERR_OK;
+}
+
+// 'ByteStream.Zeros.Copy(crcStream, n)' (line 98)
+static enumError nkit_out_zeros ( nkit_out_t *o, u64 size )
+{
+    static const u8 zeros[0x10000] = {0};
+    while (size)
+    {
+	u32 chunk = size < sizeof(zeros) ? (u32)size : sizeof(zeros);
+	enumError err = nkit_out_write(o,zeros,chunk);
+	if (err)
+	    return err;
+	size -= chunk;
+    }
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// prtStream.Read(...) -- StreamCircularBuffer.Read() blocks until it has
+// delivered the full request; the spool-mode buffer here just needs the
+// short-read loop.
+static enumError nkit_cb_read_all ( nkit_circular_buffer_t *cb, u8 *data, u32 size )
+{
+    while (size)
+    {
+	u32 n = nkit_circular_buffer_read(cb,data,size);
+	if (!n)
+	    return ERROR0(ERR_READ_FAILED,"NKit: partition data stream ended early\n");
+	data += n;
+	size -= n;
+    }
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// One preserved-hash group: NkitPartitionPatchInfo.HashGroups's
+// Dictionary<long,MemorySection>. Only ever added to and looked up by exact
+// key, so a growable array with a linear find matches it exactly (there are
+// at most a few per partition on a clean image).
+typedef struct nkit_hash_group_t
+{
+    u64		offset;		// dictionary key: absolute output offset of the group
+    u8		*data;		// MemorySection value: a full GroupSize clone of wp.Decrypted
+    u32		size;
+}
+nkit_hash_group_t;
+
+// Full NkitPartitionPatchInfo (Conversion/NkitPartitionPatchInfo.cs). The
+// narrower nkit_partition_patch_info_t above carries only the 3 fields
+// nkit_partition_stream_write() touches; this is the whole bag Read() needs,
+// and embeds that narrower struct so the already-ported producer can be
+// handed a pointer to it unchanged.
+typedef struct nkit_patch_info_t
+{
+    nkit_partition_patch_info_t	inner;		// ScrubManager + PartitionDataHeader + Fst
+    u64				disc_offset;	// DiscOffset
+    u8				*partition_header;	// PartitionHeader (0x20000), owned
+    u32				partition_header_size;
+    nkit_hash_group_t		*hash_group;	// HashGroups, owned
+    uint			n_hash_group, hash_group_cap;
+}
+nkit_patch_info_t;
+
+// Size { get { return PartitionHeader == null ? 0 : PartitionHeader.ReadUInt32B(0x2bc)*4; } }
+// -- a computed property, so it reflects the *restored* partition size the
+// group loop patches into 0x2bc, not the shrunken one the file carried.
+static u64 nkit_patch_info_size ( const nkit_patch_info_t *pi )
+{
+    return pi->partition_header ? (u64)be32(pi->partition_header+0x2bc) * 4 : 0;
+}
+
+static nkit_hash_group_t * nkit_patch_info_find_hash_group ( nkit_patch_info_t *pi, u64 offset )
+{
+    for ( uint i = 0; i < pi->n_hash_group; i++ )
+	if ( pi->hash_group[i].offset == offset )
+	    return pi->hash_group + i;
+    return 0;
+}
+
+static void nkit_patch_info_add_hash_group ( nkit_patch_info_t *pi, u64 offset, const u8 *data, u32 size )
+{
+    if ( pi->n_hash_group == pi->hash_group_cap )
+    {
+	pi->hash_group_cap = pi->hash_group_cap ? pi->hash_group_cap*2 : 8;
+	pi->hash_group = REALLOC(pi->hash_group,pi->hash_group_cap*sizeof(*pi->hash_group));
+    }
+    nkit_hash_group_t *hg = pi->hash_group + pi->n_hash_group++;
+    hg->offset = offset;
+    hg->size   = size;
+    hg->data   = MALLOC(size);
+    memcpy(hg->data,data,size);
+}
+
+static void nkit_patch_info_reset_mem ( nkit_patch_info_t *pi )
+{
+    for ( uint i = 0; i < pi->n_hash_group; i++ )
+	FREE(pi->hash_group[i].data);
+    if (pi->hash_group)			FREE(pi->hash_group);
+    if (pi->partition_header)		FREE(pi->partition_header);
+    if (pi->inner.partition_data_header) FREE(pi->inner.partition_data_header);
+    if (pi->inner.fst)			FREE(pi->inner.fst);
+    memset(pi,0,sizeof(*pi));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Growable byte buffer for the 'patchBlocks' MemoryStream (Read() line 215)
+// and for CrcItem.PatchData.
+typedef struct nkit_buf_t
+{
+    u8		*data;
+    u64		len, cap;
+}
+nkit_buf_t;
+
+static void nkit_buf_append ( nkit_buf_t *b, const u8 *data, u64 size )
+{
+    if ( b->len + size > b->cap )
+    {
+	while ( b->len + size > b->cap )
+	    b->cap = b->cap ? b->cap*2 : NKIT_PARTITION_GROUP_SIZE;
+	b->data = REALLOC(b->data,b->cap);
+    }
+    memcpy(b->data+b->len,data,size);
+    b->len += size;
+}
+
+static void nkit_buf_reset_mem ( nkit_buf_t *b )
+{
+    if (b->data) FREE(b->data);
+    memset(b,0,sizeof(*b));
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of repairBlocks(WiiPartitionGroupSection wp, int scrubbed, int blocks,
+// bool forceBlockChanged, bool fstBlocks) -- NkitReaderWii.cs:301-310.
+// 'forceBlockChanged' and 'fstBlocks' are dead parameters in the C# too (the
+// method body never reads either) -- kept in the signature here only so the
+// two call sites read the same as the original.
+static bool nkit_repair_blocks
+	( nkit_group_t *wp, uint scrubbed, uint blocks, bool force_block_changed, bool fst_blocks )
+{
+    (void)force_block_changed;
+    (void)fst_blocks;
+
+    bool is_valid = true;
+
+    if ( scrubbed == 0 )
+	is_valid = nkit_group_is_valid(wp,true);
+    else if ( scrubbed == blocks )
+    {
+	// copy the first data sector hash sector for each block (to pretend
+	// we still had the scrubbed hashes)
+	u8 *dec = nkit_group_decrypted(wp);
+	for ( uint i = 0; i < blocks; i++ )
+	    memcpy(dec+i*WII_SECTOR_SIZE,dec+i*WII_SECTOR_SIZE+WII_SECTOR_HASH_SIZE,WII_SECTOR_HASH_SIZE);
+    }
+    return is_valid;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of hashPatchGroup(NkitPartitionPatchInfo pi, WiiPartitionGroupSection wp)
+// -- NkitReaderWii.cs:349-367. Scatters the group's preserved (verbatim
+// carried) 0x400 byte hash areas -- which WiiHashStore.ReadPatchData() packed
+// contiguously into the front of the stored group buffer -- back out to one
+// per WII_SECTOR_SIZE block, then re-marks whichever blocks the scrub manager
+// says were scrubbed.
+static void nkit_hash_patch_group ( nkit_patch_info_t *pi, nkit_group_t *wp )
+{
+    uint block_count = (uint)( wp->size / WII_SECTOR_SIZE );
+
+    const nkit_hash_group_t *hg = nkit_patch_info_find_hash_group(pi,wp->disc_offset);
+    u8 *dec = nkit_group_decrypted(wp);
+    for ( uint i = 0; i < block_count; i++ )
+	memcpy(dec+i*WII_SECTOR_SIZE,hg->data+i*WII_SECTOR_HASH_SIZE,WII_SECTOR_HASH_SIZE);
+
+    // C#: 'byte[] e = wp.Encrypted;' -- assigned to an unused local, but NOT
+    // dead code: the getter materialises _enc from the freshly-patched _dec
+    // *before* the scrub marking below flips _hasEnc back off, so the
+    // caller's own wp.Encrypted then re-encrypts with the scrubbed-block IVs
+    // instead of plain zero IVs. Ported for the side effect, same as the C#.
+    nkit_group_encrypted(wp);
+
+    for ( uint bi = 0; bi < block_count; bi++ )
+    {
+	u8 byt;
+	if ( nkit_scrub_manager_is_block_scrubbed(pi->inner.scrub_manager,
+		wp->offset + (u64)bi*WII_SECTOR_SIZE,&byt) )
+	{
+	    nkit_group_mark_block_dirty(wp,bi);	// will be reset by ApplyHashes
+	    nkit_group_set_scrubbed(wp,bi,byt);
+	}
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of fstPatch(NkitPartitionPatchInfo pi, WiiPartitionGroupSection wp,
+// long patchOffset, byte[] crcPatchData, Stream fst) -- NkitReaderWii.cs:369-437.
+//
+// This is what actually makes the restored image's filesystem correct. The
+// partition data stream carries the FST as NKit repacked it (gapless file
+// offsets); the restore pass recomputes every file's original offset/length
+// while writing, patching them into its in-memory 'fst' buffer -- but by then
+// the stale FST bytes have already gone out to the file. fstPatch() re-injects
+// the corrected FST into the encrypted patch blob that Processor's final pass
+// writes back over that region, re-deriving the affected groups' hash trees.
+//
+// 'fst' is a Stream read sequentially in the C#; here it's the fst buffer plus
+// a running read cursor ('fst_pos').
+static enumError nkit_fst_patch
+(
+    nkit_patch_info_t	*pi,
+    nkit_group_t	*wp,
+    u8			*group_data,	// wp.Data: the caller's GroupSize scratch buffer
+    u64			patch_offset,	// patchOffset
+    u8			*patch,		// crcPatchData (modified in place)
+    u64			patch_len
+)
+{
+    u64 fst_offset = (u64)be32(pi->inner.partition_data_header+0x424) * 4;
+    u64 length     = pi->inner.fst_size;
+
+    // seek to fst group
+    s64 base_group_idx = (s64)( ( patch_offset - ( pi->disc_offset + pi->partition_header_size ) )
+				/ NKIT_PARTITION_GROUP_SIZE );
+
+    s64 gs = (s64)( fst_offset / ( 0x7c00ull * 64 ) );
+    s64 ge = (s64)( ( fst_offset + length ) / ( 0x7c00ull * 64 ) );
+    if ( ( fst_offset + length ) % ( 0x7c00ull * 64 ) == 0 )
+	ge--; // don't load the next group if the data will end on the last byte
+
+    if ( gs > base_group_idx || ge < base_group_idx )
+	return ERR_OK;
+
+    u64 dest_pos = 0;	// MemoryStream position over crcPatchData
+    if ( gs != base_group_idx )
+	dest_pos += (u64)( gs - base_group_idx ) * NKIT_PARTITION_GROUP_SIZE;
+
+    // offset in hashed group
+    u64 dst_offset = ( fst_offset / 0x7c00ull * 0x8000ull + fst_offset % 0x7c00ull ) // DataToHashedLen()
+			% NKIT_PARTITION_GROUP_SIZE;
+    u64 total = 0;
+    u64 fst_pos = 0;	// read cursor into pi->inner.fst
+
+    u64 part_data_size = (u64)be32(pi->partition_header+0x2bc) * 4; // wp.Header.ReadUInt32B(0x2bc)*4
+
+    for ( s64 i = gs; i <= ge; i++ )
+    {
+	// can be less than 2mb if partition is small (or we are at the end)
+	u64 group_span = (u64)i * NKIT_PARTITION_GROUP_SIZE;
+	if ( group_span >= part_data_size )
+	    break;
+	u64 data_len = part_data_size - group_span;
+	if ( data_len > NKIT_PARTITION_GROUP_SIZE )
+	    data_len = NKIT_PARTITION_GROUP_SIZE;
+
+	// int read = dest.Read(wp.Data, 0, wp.Data.Length); ... dest.Seek(-read, Current);
+	u64 read = patch_len > dest_pos ? patch_len - dest_pos : 0;
+	if ( read > NKIT_PARTITION_GROUP_SIZE )
+	    read = NKIT_PARTITION_GROUP_SIZE;
+	if ( read == 0 )
+	    break;
+	memcpy(group_data,patch+dest_pos,read);
+	if ( read < NKIT_PARTITION_GROUP_SIZE )
+	    memset(group_data+read,0,NKIT_PARTITION_GROUP_SIZE-read);
+
+	nkit_group_populate(wp,(int)i,group_data,NKIT_PARTITION_GROUP_SIZE,patch_offset,data_len); // auto decrypted
+	u8 *dec = nkit_group_decrypted(wp);
+
+	while ( length != total && dst_offset != NKIT_PARTITION_GROUP_SIZE )
+	{
+	    dst_offset += WII_SECTOR_HASH_SIZE;	// skip hashes
+	    u64 want = length - total;
+	    u64 room = WII_SECTOR_SIZE - dst_offset % WII_SECTOR_SIZE;
+	    u64 l = want < room ? want : room;
+	    // no padding etc as fst will be the same size
+	    memcpy(dec+dst_offset,pi->inner.fst+fst_pos,l);
+	    fst_pos    += l;
+	    dst_offset += l;
+	    total      += l;
+	}
+
+	memset(dec+data_len,0,(size_t)(wp->size - data_len));
+
+	uint bnk_count = (uint)( data_len / WII_SECTOR_SIZE );
+	uint scrubbed_count = 0;
+	for ( uint bi = 0; bi < bnk_count; bi++ )
+	{
+	    nkit_group_mark_block_dirty(wp,bi);	// set to force hash generation
+	    u8 byt;
+	    if ( nkit_scrub_manager_is_block_scrubbed(pi->inner.scrub_manager,
+		    wp->offset + (u64)bi*WII_SECTOR_SIZE,&byt) )
+	    {
+		nkit_group_set_scrubbed(wp,bi,byt);
+		scrubbed_count++;
+	    }
+	}
+
+	nkit_repair_blocks(wp,scrubbed_count,bnk_count,true,false);
+
+	// dest.Write(wp.Encrypted, 0, dataLen);
+	u8 *enc = nkit_group_encrypted(wp);
+	if ( dest_pos + data_len > patch_len )
+	    return ERROR0(ERR_INTERNAL,"NKit: fst patch overruns the patch buffer\n");
+	memcpy(patch+dest_pos,enc,data_len);
+	dest_pos += data_len;
+
+	dst_offset = 0;
+    }
+    return ERR_OK;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of patchGroups(NkitPartitionPatchInfo patchInfo, WiiDiscHeaderSection
+// discHeader, long crcPatchOffset, byte[] crcPatchData) -- NkitReaderWii.cs:
+// 312-347. Walks one CRC checkpoint's accumulated encrypted-group blob a
+// group at a time, letting fstPatch() correct the FST and hashPatchGroup()
+// reinstate preserved hash areas, rewriting the blob in place.
+static enumError nkit_patch_groups
+(
+    nkit_patch_info_t	*pi,
+    u64			crc_patch_offset,
+    u8			*patch,
+    u64			patch_len
+)
+{
+    u64 part_data_offset = pi->disc_offset + pi->partition_header_size;
+    int group_idx = (int)( ( crc_patch_offset - part_data_offset ) / NKIT_PARTITION_GROUP_SIZE );
+
+    u8 *data = MALLOC(NKIT_PARTITION_GROUP_SIZE);
+    memset(data,0,NKIT_PARTITION_GROUP_SIZE);
+
+    // WiiPartitionHeaderSection wh = new(...); wh.ScrubManager = pi.ScrubManager;
+    // wh.Initialise(true, pi.PartitionDataHeader.ReadString(0,4));
+    // -- Initialise(bool,string) only assigns IsEncrypted/Id, neither of which
+    // anything downstream of here reads; the fields that DO matter (Key,
+    // H3Table) come from the ctor, exactly as in the C#.
+    nkit_part_header_t wh;
+    enumError err = nkit_part_header_init(&wh,pi->partition_header,pi->partition_header_size);
+    if (err)
+    {
+	FREE(data);
+	return err;
+    }
+    if (wh.is_rvt_h)
+    {
+	nkit_part_header_reset_mem(&wh);
+	FREE(data);
+	return ERROR0(ERR_NOT_IMPLEMENTED,"NKit: unsupported (RVT signed) partition\n");
+    }
+
+    u64 first_size = patch_len < NKIT_PARTITION_GROUP_SIZE ? patch_len : NKIT_PARTITION_GROUP_SIZE;
+    nkit_group_t wp;
+    err = nkit_group_init(&wp,&wh,data,NKIT_PARTITION_GROUP_SIZE,part_data_offset,first_size,true,false);
+    if (err)
+	goto done;
+
+    if (pi->inner.fst)
+    {
+	err = nkit_fst_patch(pi,&wp,data,crc_patch_offset,patch,patch_len);
+	if (err)
+	    goto done;
+    }
+
+    for ( u64 i = 0; i < patch_len; i += NKIT_PARTITION_GROUP_SIZE )
+    {
+	u64 n = patch_len - i;
+	if ( n > NKIT_PARTITION_GROUP_SIZE )
+	    n = NKIT_PARTITION_GROUP_SIZE;
+
+	memcpy(data,patch+i,n);
+	if ( n < NKIT_PARTITION_GROUP_SIZE )
+	    memset(data+n,0,NKIT_PARTITION_GROUP_SIZE-n);
+
+	nkit_group_populate(&wp,group_idx++,data,NKIT_PARTITION_GROUP_SIZE,crc_patch_offset+i,n);
+	nkit_group_force_hashes(&wp,0);
+
+	if ( nkit_patch_info_find_hash_group(pi,wp.disc_offset) )
+	{
+	    nkit_hash_patch_group(pi,&wp);
+	    u8 *enc = nkit_group_encrypted(&wp);
+	    memcpy(patch+i,enc,(size_t)wp.size);
+	}
+    }
+
+ done:
+    nkit_group_reset_mem(&wp);
+    nkit_part_header_reset_mem(&wh);
+    FREE(data);
+    return err;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Port of NkitReaderWii.Read() -- NkitReaderWii.cs:28-299. The entry point
+// XCONVERT dispatches a Wii .nkit.iso to (see lib-xfile.c), mirroring
+// XExtractNKitGC()'s shape in x-nkit.c.
+
+enumError XExtractNKitWii ( ccp source, ccp dest )
+{
+    enumError err = ERR_OK;
+
+    FILE *src = fopen(source,"rb");
+    if (!src)
+	return ERROR1(ERR_CANT_OPEN,"Can't open file: %s\n",source);
+
+    fseeko(src,0,SEEK_END);
+    const u64 src_length = (u64)ftello(src);
+    fseeko(src,0,SEEK_SET);
+
+    // WiiDiscHeaderSection: NStream._HeaderSizeWii == 0x50000, i.e. everything
+    // through the partition table at 0x40000 plus its entries.
+    const uint HDR_SIZE = 0x50000;
+
+    u8 *hdr = MALLOC(HDR_SIZE);
+    FILE *out = 0, *spool = 0;
+    char *spool_name = 0;
+    nkit_crc_t crc;
+    nkit_crc_init(&crc);
+    nkit_disc_header_t dh;
+    memset(&dh,0,sizeof(dh));
+    nkit_scrub_manager_t scrub_filler;
+    nkit_scrub_manager_init(&scrub_filler,false,0,0);	// ScrubManager(null) -- line 51
+    nkit_patch_info_t *patch_infos = 0;
+    uint n_patch_infos = 0;
+    u8 *ph = 0;			// MemorySection ph = new byte[0x8000*64]
+    nkit_buf_t patch_blocks = {0};
+
+    if ( fread(hdr,1,HDR_SIZE,src) != HDR_SIZE )
+    {
+	err = ERROR0(ERR_READ_FAILED,"Truncated NKit file: %s\n",source);
+	goto abort;
+    }
+
+    if ( memcmp(hdr+0x200,"NKIT v01",8) )
+    {
+	err = ERROR0(ERR_WRONG_FILE_TYPE,"Not an NKit v01 Wii image: %s\n",source);
+	goto abort;
+    }
+
+    const u32 nkit_crc		= be32(hdr+0x208);
+    const u64 image_size	= (u64)be32(hdr+0x210) * 4;
+    const u32 update_partition_crc = be32(hdr+0x218);
+
+    if (update_partition_crc)
+    {
+	// See the "RecoveryData.GetUpdatePartition()" note in this section's
+	// header comment.
+	err = ERROR0(ERR_NOT_IMPLEMENTED,
+	    "NKit image has its update partition removed (crc %08x); restoring it needs"
+	    " an external update-partition blob this build has no source for: %s\n",
+	    update_partition_crc, source );
+	goto abort;
+    }
+
+    if ((err = nkit_disc_header_init(&dh,hdr,HDR_SIZE)))
+	goto abort;
+    if (!dh.n_part)
+    {
+	err = ERROR0(ERR_WIA_INVALID,"NKit image has no partitions: %s\n",source);
+	goto abort;
+    }
+    // 'foreach (WiiPartitionInfo part in hdr.Partitions) //already sorted'
+    qsort(dh.part,dh.n_part,sizeof(*dh.part),nkit_part_info_cmp);
+
+    // Blank NKit's own tag fields so the restored disc header is pristine again.
+    for ( uint o = 0x200; o <= 0x218; o += 4 )
+	write_be32(hdr+o,0);
+    hdr[0x60] = 0;
+    hdr[0x61] = 0;
+
+    out = fopen(dest,"w+b");
+    if (!out)
+    {
+	err = ERROR1(ERR_CANT_CREATE,"Can't create file: %s\n",dest);
+	goto abort;
+    }
+
+    nkit_out_t o = { .f = out, .crc = &crc, .fname = dest };
+
+    // The partition producer spools to a temp file next to the destination
+    // (see nkit_circular_buffer_set_spool()'s note); it is truncated and
+    // reused for every partition, and removed on the way out.
+    spool_name = MALLOC(strlen(dest)+16);
+    sprintf(spool_name,"%s.nkittmp",dest);
+    spool = fopen(spool_name,"w+b");
+    if (!spool)
+    {
+	err = ERROR1(ERR_CANT_CREATE,"Can't create temp file: %s\n",spool_name);
+	goto abort;
+    }
+
+    u64 dst_pos = 0, src_pos = HDR_SIZE;
+
+    if ((err = nkit_out_write(&o,hdr,HDR_SIZE)))	// write the header
+	goto abort;
+    dst_pos += HDR_SIZE;
+    nkit_crc_snapshot(&crc,"Disc Header");
+
+    ph = MALLOC(NKIT_PARTITION_GROUP_SIZE);
+    patch_infos = MALLOC(dh.n_part*sizeof(*patch_infos));
+    memset(patch_infos,0,dh.n_part*sizeof(*patch_infos));
+
+    char last_partition_id[8] = "";
+    nkit_part_type_t last_partition_type = NKIT_PART_OTHER;
+
+    for ( uint pidx = 0; pidx < dh.n_part; pidx++ )
+    {
+	nkit_part_info_t *part = dh.part + pidx;
+	nkit_patch_info_t *pi = patch_infos + pidx;
+	n_patch_infos = pidx+1;
+
+	if ( part->disc_offset > src_pos )
+	{
+	    // writeFiller(...) straight to the output stream (line 107)
+	    u8 junk_id[4];
+	    if ( last_partition_type != NKIT_PART_DATA )
+		memcpy(junk_id,hdr,4);
+	    else
+		memcpy(junk_id,last_partition_id,4);
+
+	    nkit_wii_junk_t fjunk;
+	    nkit_wii_junk_init(&fjunk,junk_id,hdr[6],
+		last_partition_type == NKIT_PART_UPDATE ? 0 : image_size);
+
+	    nkit_circular_buffer_t fout;
+	    memset(&fout,0,sizeof(fout));
+	    fout.sink = &o;	// writeFiller() targets crcStream, i.e. the output
+
+	    u64 filler_len;
+	    err = nkit_write_filler(&src_pos,dst_pos,dst_pos+0x1cull,src,&fout,
+		nkit_wii_junk_read_adapter,&fjunk,&scrub_filler,&filler_len);
+	    if (err)
+		goto abort;
+	    dst_pos += filler_len;
+
+	    // inStream.Copy(ByteStream.Zeros, part.DiscOffset - srcPos) -- padded to 0x8000
+	    if ( part->disc_offset > src_pos )
+	    {
+		if ((err = nkit_stream_skip(src,part->disc_offset-src_pos)))
+		    goto abort;
+		src_pos = part->disc_offset;
+	    }
+	}
+
+	part->disc_offset = dst_pos;	// restore the original position
+	pi->disc_offset   = dst_pos;
+
+	pi->partition_header_size = 0x20000;
+	pi->partition_header = MALLOC(pi->partition_header_size);
+	if ( fread(pi->partition_header,1,pi->partition_header_size,src) != pi->partition_header_size )
+	{
+	    err = ERROR0(ERR_READ_FAILED,"Truncated NKit file: %s\n",source);
+	    goto abort;
+	}
+	src_pos += pi->partition_header_size;
+
+	const u64 part_size = (u64)be32(pi->partition_header+0x2bc) * 4;
+
+	nkit_part_header_t wh;
+	if ((err = nkit_part_header_init(&wh,pi->partition_header,pi->partition_header_size)))
+	    goto abort;
+	if (wh.is_rvt_h)
+	{
+	    nkit_part_header_reset_mem(&wh);
+	    err = ERROR0(ERR_NOT_IMPLEMENTED,
+		"NKit: unsupported (RVT signed) partition in %s\n",source);
+	    goto abort;
+	}
+
+	nkit_scrub_manager_t part_scrub;
+	nkit_scrub_manager_init(&part_scrub,true,wh.decrypted_00,wh.decrypted_ff);
+	pi->inner.scrub_manager = &part_scrub;
+
+	nkit_hash_store_t hashes;
+	nkit_hash_store_init(&hashes,0);	// new WiiHashStore(); WriteFlagsData() sizes it
+
+	// ---- producer: partitionStreamWrite() into the spool ----------------
+	rewind(spool);
+	if ( ftruncate(fileno(spool),0) )
+	{
+	    err = ERROR1(ERR_WRITE_FAILED,"Can't truncate temp file: %s\n",spool_name);
+	    goto part_abort;
+	}
+	nkit_circular_buffer_t prt;
+	memset(&prt,0,sizeof(prt));
+	nkit_circular_buffer_set_spool(&prt,spool);
+
+	u64 orig_size = 0, producer_src_pos = 0;
+	err = nkit_partition_stream_write(&orig_size,src,&prt,part_size,
+		&pi->inner,&hashes,&producer_src_pos);
+	if (err)
+	    goto part_abort;
+	src_pos += producer_src_pos;
+
+	if ( orig_size != prt.w_position )
+	{
+	    err = ERROR0(ERR_WIA_INVALID,
+		"NKit: partition read did not write the full amount to the buffer"
+		" (%llu of %llu): %s\n", (u64)prt.w_position, (u64)orig_size, source );
+	    goto part_abort;
+	}
+
+	fflush(spool);
+	rewind(spool);
+	prt.r_position = 0;
+
+	// ---- consumer: the group loop --------------------------------------
+	nkit_group_t wp;
+	memset(&wp,0,sizeof(wp));
+	bool wp_valid = false;
+
+	u64 remaining = (u64)-1;	// long.MaxValue: set after first block read
+	int group_index = 0;
+	s64 gs = 0, ge = 0;
+	s64 i = 0;
+	bool patch_block = false;
+	patch_blocks.len = 0;
+
+	while ( remaining > 0 )
+	{
+	    uint blocks = (uint)( remaining/WII_SECTOR_DATA_SIZE < WII_GROUP_SECTORS
+				    ? remaining/WII_SECTOR_DATA_SIZE : WII_GROUP_SECTORS );
+	    for ( uint b = 0; b < blocks; b++ )
+	    {
+		// load aligned with no hashes
+		if ((err = nkit_cb_read_all(&prt,ph+b*WII_SECTOR_SIZE+WII_SECTOR_HASH_SIZE,
+			WII_SECTOR_DATA_SIZE)))
+		    goto part_abort;
+
+		if ( remaining == (u64)-1 )	// first loop
+		{
+		    remaining = orig_size;
+
+		    const u8 *pdh = ph + WII_SECTOR_HASH_SIZE;	// ph.Read*(0x400 + x)
+
+		    if (!memcmp(pdh,"\0\0\0\0",4))
+		    {
+			gs = -1;
+			ge = -1;
+			blocks = (uint)( remaining/WII_SECTOR_DATA_SIZE < WII_GROUP_SECTORS
+					    ? remaining/WII_SECTOR_DATA_SIZE : WII_GROUP_SECTORS );
+			memcpy(last_partition_id,pdh,4);
+			last_partition_id[4] = 0;
+			// restore real size: DataToHashedLen(origSize)/4
+			write_be32(pi->partition_header+0x2bc,
+			    (u32)( ( orig_size/0x7c00ull*0x8000ull + orig_size%0x7c00ull ) / 4 ));
+		    }
+		    else
+		    {
+			gs = (s64)( ( (u64)be32(pdh+0x424) * 4 ) / ( 0x7c00ull*64 ) );
+			ge = (s64)( ( (u64)be32(pdh+0x424) * 4 + (u64)be32(pdh+0x428) * 4 )
+				    / ( 0x7c00ull*64 ) );
+			if ( ( part->disc_offset + (u64)be32(pdh+0x428) * 4 ) % ( 0x7c00ull*64 ) == 0 )
+			    ge--; // don't load the next group if the data will end on the last byte
+
+			blocks = (uint)( remaining/WII_SECTOR_DATA_SIZE < WII_GROUP_SECTORS
+					    ? remaining/WII_SECTOR_DATA_SIZE : WII_GROUP_SECTORS );
+			memcpy(last_partition_id,pdh,4);
+			last_partition_id[4] = 0;
+
+			// restore real size (already a /4 scaled value)
+			memcpy(pi->partition_header+0x2bc,pdh+0x210,4);
+
+			// blank the partition's own NKit tag fields
+			for ( uint z = 0x200; z <= 0x218; z += 4 )
+			    write_be32(ph+WII_SECTOR_HASH_SIZE+z,0);
+		    }
+
+		    if ((err = nkit_out_write(&o,pi->partition_header,pi->partition_header_size)))
+			goto part_abort;
+		    dst_pos += pi->partition_header_size;
+
+		    if ((err = nkit_group_init(&wp,&wh,ph,NKIT_PARTITION_GROUP_SIZE,
+			    part->disc_offset,(u64)blocks*WII_SECTOR_SIZE,false,false)))
+			goto part_abort;
+		    wp_valid = true;
+		}
+	    }
+
+	    if ( blocks < WII_GROUP_SECTORS )	// clear remaining blocks
+		memset(ph+(u64)blocks*WII_SECTOR_SIZE,0,
+		    NKIT_PARTITION_GROUP_SIZE-(size_t)blocks*WII_SECTOR_SIZE);
+
+	    nkit_group_populate(&wp,group_index,ph,NKIT_PARTITION_GROUP_SIZE,
+		dst_pos,(u64)blocks*WII_SECTOR_SIZE);
+
+	    uint scrubbed = 0;
+	    for ( uint bi = 0; bi < blocks; bi++ )
+	    {
+		nkit_group_mark_block_dirty(&wp,bi);
+		u8 byt;
+		if ( nkit_scrub_manager_is_block_scrubbed_scan_mode(&part_scrub,
+			wp.offset + (u64)bi*WII_SECTOR_SIZE,&byt) )
+		{
+		    nkit_group_set_scrubbed(&wp,bi,byt);
+		    scrubbed++;
+		}
+	    }
+	    bool is_fst_blocks = i >= gs && i <= ge;
+	    // test with 0 partition based offset
+	    bool req_hashes = nkit_hash_store_is_preserved(&hashes,wp.offset);
+
+	    // only test if the hashes aren't preserved (only preserved for scrubbed/customs)
+	    nkit_repair_blocks(&wp,scrubbed,blocks,false,is_fst_blocks);
+
+	    if (req_hashes)	// store with disc based offset -- fetch the stored
+	    {			// hashes that couldn't be recreated
+		u8 *dec = nkit_group_decrypted(&wp);
+		nkit_patch_info_add_hash_group(pi,
+		    wp.offset + part->disc_offset + pi->partition_header_size,
+		    dec, NKIT_PARTITION_GROUP_SIZE);
+	    }
+
+	    group_index++;
+	    bool in_fst_area = i >= gs && i <= ge;
+
+	    if ( !patch_block && ( gs == i || req_hashes ) )
+	    {
+		patch_blocks.len = 0;
+		char nm[32];
+		snprintf(nm,sizeof(nm),"%s Data",last_partition_id);
+		nkit_crc_snapshot(&crc,nm);
+		patch_block = true;
+	    }
+	    else if ( patch_block && !in_fst_area && !req_hashes )
+	    {
+		char nm[32];
+		snprintf(nm,sizeof(nm),"%s Patch",last_partition_id);
+		nkit_crc_snapshot(&crc,nm);
+		nkit_crc_item_t *last = crc.crcs + crc.n_crcs-1;
+		last->patch_data_size = (uint)patch_blocks.len;
+		last->patch_data = MALLOC(patch_blocks.len);
+		memcpy(last->patch_data,patch_blocks.data,patch_blocks.len);
+		patch_blocks.len = 0;
+		patch_block = false;
+	    }
+
+	    u8 *enc = nkit_group_encrypted(&wp);
+	    if ((err = nkit_out_write(&o,enc,(u64)blocks*WII_SECTOR_SIZE)))
+		goto part_abort;
+	    if (patch_block)
+		nkit_buf_append(&patch_blocks,enc,(u64)blocks*WII_SECTOR_SIZE);
+
+	    remaining -= (u64)blocks * WII_SECTOR_DATA_SIZE;
+	    dst_pos   += (u64)blocks * WII_SECTOR_SIZE;
+	    i++;
+	}
+
+	if (patch_block)
+	{
+	    char nm[32];
+	    snprintf(nm,sizeof(nm),"%s Patch",last_partition_id);
+	    nkit_crc_snapshot(&crc,nm);
+	    nkit_crc_item_t *last = crc.crcs + crc.n_crcs-1;
+	    last->patch_data_size = (uint)patch_blocks.len;
+	    last->patch_data = MALLOC(patch_blocks.len);
+	    memcpy(last->patch_data,patch_blocks.data,patch_blocks.len);
+	    patch_blocks.len = 0;
+	    patch_block = false;
+	}
+
+	// srcPos += hashes.ReadPatchData(part.DiscOffset + PartitionHeader.Size,
+	//                                patchInfo.HashGroups, inStream)
+	// -- WiiHashStore.cs:62-81: every flagged group's preserved hash areas
+	// are present in the source stream and must be consumed, whether or not
+	// this partition actually kept a HashGroups entry for it.
+	{
+	    u64 partition_disc_offset = part->disc_offset + pi->partition_header_size;
+	    for ( u64 goff = 0; goff < hashes.partition_size; goff += NKIT_PARTITION_GROUP_SIZE )
+	    {
+		if (!nkit_hash_store_is_preserved(&hashes,goff))
+		    continue;
+		u64 span = hashes.partition_size - goff;
+		if ( span > NKIT_PARTITION_GROUP_SIZE )
+		    span = NKIT_PARTITION_GROUP_SIZE;
+		uint blocks = (uint)( span / WII_SECTOR_SIZE ); // read partial groups (< 64 blocks)
+		uint want = blocks * WII_SECTOR_HASH_SIZE;
+
+		nkit_hash_group_t *hg = nkit_patch_info_find_hash_group(pi,partition_disc_offset+goff);
+		if (hg)
+		{
+		    // needs to be encrypted and CRCd
+		    if ( fread(hg->data,1,want,src) != want )
+		    {
+			err = ERROR0(ERR_READ_FAILED,"Truncated NKit file: %s\n",source);
+			goto part_abort;
+		    }
+		}
+		else if ((err = nkit_stream_skip(src,want)))
+		    goto part_abort;
+		src_pos += want;
+	    }
+	}
+
+	last_partition_type = part->type;
+
+     part_abort:
+	if (wp_valid)
+	    nkit_group_reset_mem(&wp);
+	nkit_hash_store_reset_mem(&hashes);
+	nkit_part_header_reset_mem(&wh);
+	// pi->inner.scrub_manager points at this partition-local manager; the
+	// patch pass below re-derives everything it needs from it, so it must
+	// outlive the loop -- move ownership into the patch info.
+	{
+	    nkit_scrub_manager_t *keep = MALLOC(sizeof(*keep));
+	    *keep = part_scrub;
+	    pi->inner.scrub_manager = keep;
+	}
+	if (err)
+	    goto abort;
+    }
+
+    // trailing filler after the last partition (lines 265-269)
+    if ( src_pos < src_length )
+    {
+	u8 junk_id[4];
+	if ( last_partition_type != NKIT_PART_DATA )
+	    memcpy(junk_id,hdr,4);
+	else
+	    memcpy(junk_id,last_partition_id,4);
+
+	nkit_wii_junk_t fjunk;
+	nkit_wii_junk_init(&fjunk,junk_id,hdr[6],
+	    last_partition_type == NKIT_PART_UPDATE ? 0 : image_size);
+
+	nkit_circular_buffer_t fout;
+	memset(&fout,0,sizeof(fout));
+	fout.sink = &o;	// writeFiller() targets crcStream, i.e. the output
+
+	u64 filler_len;
+	err = nkit_write_filler(&src_pos,dst_pos,
+	    last_partition_type == NKIT_PART_UPDATE ? image_size : dst_pos+0x1cull,
+	    src,&fout,nkit_wii_junk_read_adapter,&fjunk,&scrub_filler,&filler_len);
+	if (err)
+	    goto abort;
+	dst_pos += filler_len;
+    }
+
+    nkit_crc_snapshot(&crc,"End");
+
+    // updatePartitionCrc == 0 here (the != 0 case bailed out above), so this
+    // is always UpdateOffsets(): just update the table with the new offsets.
+    nkit_disc_header_update_offsets(&dh);
+
+    // crc.Crcs[0].PatchData = hdr.Data
+    if ( crc.n_crcs )
+    {
+	nkit_crc_item_t *it0 = crc.crcs;
+	if (it0->patch_data)
+	    FREE(it0->patch_data);
+	it0->patch_data_size = HDR_SIZE;
+	it0->patch_data = MALLOC(HDR_SIZE);
+	memcpy(it0->patch_data,hdr,HDR_SIZE);
+    }
+
+    for ( uint ci = 0; ci < crc.n_crcs; ci++ )
+    {
+	nkit_crc_item_t *it = crc.crcs + ci;
+	if (!it->patch_data)
+	    continue;
+
+	nkit_patch_info_t *pi = 0;
+	for ( uint p = 0; p < n_patch_infos; p++ )
+	{
+	    nkit_patch_info_t *c = patch_infos + p;
+	    u64 base = c->disc_offset + c->partition_header_size;
+	    if ( it->offset >= base && it->offset < base + nkit_patch_info_size(c) )
+	    {
+		pi = c;
+		break;
+	    }
+	}
+	if (pi)
+	{
+	    if ((err = nkit_patch_groups(pi,it->offset,it->patch_data,it->patch_data_size)))
+		goto abort;
+	}
+	it->patch_crc = CalcCRC32(0,it->patch_data,it->patch_data_size);
+    }
+
+    if ( image_size != dst_pos )
+    {
+	err = ERROR0(ERR_WIA_INVALID,
+	    "NKit image read output %llu bytes not the expected %llu: %s\n",
+	    (u64)dst_pos, (u64)image_size, source );
+	goto abort;
+    }
+
+    // Processor.cs:162-174 -- apply every patch blob back over the output.
+    for ( uint ci = 0; ci < crc.n_crcs; ci++ )
+    {
+	const nkit_crc_item_t *it = crc.crcs + ci;
+	if (!it->patch_data)
+	    continue;
+	u64 n = it->length < it->patch_data_size ? it->length : it->patch_data_size;
+	if ( fseeko(out,(off_t)it->offset,SEEK_SET) )
+	{
+	    err = ERROR1(ERR_WRITE_FAILED,"Seek failed: %s\n",dest);
+	    goto abort;
+	}
+	if ( n && fwrite(it->patch_data,1,n,out) != n )
+	{
+	    err = ERROR1(ERR_WRITE_FAILED,"Write failed: %s\n",dest);
+	    goto abort;
+	}
+    }
+
+    {
+	const u32 full_crc = nkit_crc_full(&crc,true);
+	if ( full_crc != nkit_crc )
+	    err = ERROR0(ERR_WIA_INVALID,
+		"NKit Invalid: restored image CRC32 %08x does not match the CRC32 %08x"
+		" stored in the NKit header: %s\n", full_crc, nkit_crc, source );
+    }
+
+ abort:
+    if (out)
+    {
+	fclose(out);
+	out = 0;
+    }
+    if (spool)
+	fclose(spool);
+    if (spool_name)
+    {
+	unlink(spool_name);
+	FREE(spool_name);
+    }
+    if (src) fclose(src);
+    if (ph) FREE(ph);
+    nkit_buf_reset_mem(&patch_blocks);
+    for ( uint p = 0; p < n_patch_infos; p++ )
+    {
+	if (patch_infos[p].inner.scrub_manager)
+	{
+	    nkit_scrub_manager_reset_mem(patch_infos[p].inner.scrub_manager);
+	    FREE(patch_infos[p].inner.scrub_manager);
+	    patch_infos[p].inner.scrub_manager = 0;
+	}
+	nkit_patch_info_reset_mem(patch_infos+p);
+    }
+    if (patch_infos) FREE(patch_infos);
+    nkit_scrub_manager_reset_mem(&scrub_filler);
+    nkit_crc_reset_mem(&crc);
+    nkit_disc_header_reset_mem(&dh);
+    FREE(hdr);
+    return err;
 }
 
 //

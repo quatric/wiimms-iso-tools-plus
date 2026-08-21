@@ -64,6 +64,7 @@ const xformat_info_t xformat_info[XF__N] =
     { XF_XCI,	"XCI",	".xci", "Switch cartridge image",	1,0,0 },
     { XF_NSP,	"NSP",	".nsp", "Switch package",		1,0,0 },
     { XF_NKIT_GC, "NKIT", ".iso", "NKit-compressed GC image (restore only)", 0,0,1 },
+    { XF_NKIT_WII,"NKIT", ".iso", "NKit-compressed Wii image (restore only)", 0,0,1 },
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -157,13 +158,21 @@ xformat_t AnalyzeXFormat
 
     //--- NKit
     // "NKIT v01" tag stashed in the disc header's own unused 0x200 region --
-    // see x-nkit.c. Only the GC restore path is implemented so far; a Wii
-    // .nkit.iso is still recognized here (so XCONVERT reports a clear
-    // "not implemented" instead of "unknown container"), XExtractNKitGC()
-    // itself is what actually rejects the Wii case.
+    // see x-nkit.c (GC) and x-nkit-wii.c (Wii).
+    //
+    // GC vs Wii is decided by the disc magic the NKit header still carries
+    // verbatim: NKit only ever overwrites 0x200..0x218 (its own tag/CRC/size
+    // fields) plus 0x60/0x61, so WII_MAGIC at WII_MAGIC_OFF (0x18) and
+    // GC_MAGIC at GC_MAGIC_OFF (0x1c) survive untouched and are exactly the
+    // discriminator every other GC/Wii reader in this codebase already uses.
+    // The Wii partition table at 0x40000 says the same thing, but lies well
+    // past this function's XFILE_HEAD_SIZE (0x1000) sniff buffer, whereas
+    // both magics are comfortably inside it.
 
     if ( data_size >= 0x208 && !memcmp(d+0x200,"NKIT v01",8) )
-	return XF_NKIT_GC;
+	return data_size >= WII_MAGIC_OFF+WII_MAGIC_LEN
+		&& be32(d+WII_MAGIC_OFF) == WII_MAGIC
+		? XF_NKIT_WII : XF_NKIT_GC;
 
     (void)file_size;
     return XF_UNKNOWN;
@@ -336,6 +345,8 @@ enumError XConvert ( ccp source, ccp dest, xformat_t format )
     // doesn't exist in this subsystem.
     if ( src_format == XF_NKIT_GC )
 	return XExtractNKitGC(source,dest);
+    if ( src_format == XF_NKIT_WII )
+	return XExtractNKitWii(source,dest);
 
     if ( format == XF_UNKNOWN )
 	format = format_by_ext(dest);
