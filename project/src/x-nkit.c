@@ -46,13 +46,25 @@
 // This file ports NkitReaderGc.cs, NkitFormat.cs and Gaps.cs from that
 // source directly (same variable names/shapes kept where practical, so a
 // diff against the original is possible), plus a from-scratch port of the
-// id+disc+block-index junk seeding in JunkStream.cs.fillBlock(). It does
-// NOT implement the Wii path (NkitReaderWii.cs, ~750 lines) -- that needs
-// the Wii partition table, H3/H4 hash verification and AES title-key
-// handling on top of everything here, and is a distinctly larger follow-on
-// task. Every local .nkit sample available to verify against happens to be
-// Wii, so this file currently builds clean but is UNVERIFIED against a real
-// file -- see the XExtractNKitGC comment below.
+// id+disc+block-index junk seeding in JunkStream.cs.fillBlock().
+//
+// The Wii path (NkitReaderWii.cs) lives in its own file, x-nkit-wii.c, and
+// IS implemented and verified -- see that file's header. lib-xfile.c picks
+// between the two by disc magic.
+//
+// This GC path, by contrast, is still UNVERIFIED against a real file: every
+// .nkit sample available locally happens to be Wii. See the XExtractNKitGC
+// comment below.
+//
+// Known gap vs. the verified Wii port: nkit_junk_get() below has no
+// equivalent of JunkStream's _junkLength truncation (Math2.Align(length,
+// 0x8000), i.e. rounded DOWN -- everything at or past it reads as NUL rather
+// than generator output; see nkit_wii_junk_t in x-nkit-wii.c, where getting
+// this wrong produced a mismatch on every partition tail). It is deliberately
+// not "fixed" here on spec, because the GC reader passes no length through
+// this generator at all and there is no GC sample to confirm the correct
+// value against -- doing it blind would just trade one unverified behaviour
+// for another. Revisit together, with a real GC sample in hand.
 //
 // The junk generator itself needed no new primitive: lib-lfg.c already
 // implements exactly this LFG (see its own header comment, which already
@@ -494,8 +506,7 @@ enumError XExtractNKitGC ( ccp source, ccp dest )
 
     if ( memcmp(hdr+NKIT_TAG_OFF,"NKIT v01",8) )
     {
-	err = ERROR0(ERR_WRONG_FILE_TYPE,
-	    "Not an NKit v01 GC image (or a Wii one -- Wii restore isn't implemented yet): %s\n",source);
+	err = ERROR0(ERR_WRONG_FILE_TYPE,"Not an NKit v01 GC image: %s\n",source);
 	goto abort;
     }
 

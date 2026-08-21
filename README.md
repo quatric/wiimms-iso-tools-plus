@@ -42,7 +42,7 @@ them into that pipeline they get their own four commands — `XINFO`, `XEXTRACT`
 | **NDS** (DS/DSi) | **yes** | **yes** | `XINFO`, `XEXTRACT`, `XCREATE` | full file system, both CPU binaries, overlays and banner |
 | **WAD** (installable Wii title) | **yes** | **yes** | `XINFO`, `XEXTRACT`, `XCREATE` | contents decrypted and re-encrypted, TMD re-signed only when something changed |
 | 3DS (CCI/CIA) / Switch (XCI/NSP) | detect | no | `XINFO` | identified, not yet unpacked |
-| NKit | planned | planned | | upstream detects NKit images and refuses them |
+| **NKit** (`.nkit.iso`) | **restore** | no | `XCONVERT` | Wii restore is byte exact (CRC32 matches the CRC stored in the NKit header); GameCube restore is implemented but still unverified against a real sample |
 
 ### RVZ
 
@@ -118,6 +118,41 @@ thing that can tell you the key was right.  `XCREATE` re-encrypts them, updates
 the TMD sizes and hashes, and fake signs the TMD — but only if a content
 actually changed, so extracting and repacking an untouched WAD gives back the
 original file byte for byte and a genuinely signed title keeps its signature.
+
+### NKit
+
+NKit shrinks a GameCube/Wii ISO by throwing away the disc's *junk data* — the
+pseudo-random padding the SDK writes between files — and keeping just enough
+per-gap metadata to regenerate it later.  `XCONVERT` restores the original
+image:
+
+```
+wit XCONVERT game.nkit.iso game.iso
+```
+
+GameCube and Wii images are told apart automatically by the disc magic the NKit
+header still carries.  The Wii path rebuilds each partition's file system,
+regenerates the junk, re-derives the whole H0–H3 hash tree and re-encrypts every
+group with the ticket's title key, then checks the finished image against the
+CRC32 stored in the NKit header — so a successful restore is a byte exact one,
+not merely a plausible one.  Restoring an image whose update partition was
+removed at conversion time is refused, because putting it back needs a copy of
+that partition this tool has no source for.
+
+Note that `.nkit.gcz` — the form most NKit images are distributed in — is an
+NKit stream wrapped in Dolphin's GCZ container, and `wit` cannot unwrap it.
+`wit`'s GCZ reader decompresses the container and then validates the payload as
+a GC/Wii disc, which an NKit stream deliberately is not, so it is rejected with
+`WRONG FILE TYPE / GameCube or Wii ISO image expected` before any copy happens;
+no flag (`--raw` included) changes that, because the rejection is in source
+detection, not in the copy.  Strip the GCZ layer with any plain GCZ
+decompressor first, then convert the `.nkit.iso`:
+
+```
+gcz-decompress game.nkit.gcz game.nkit.iso   # any GCZ tool; Dolphin's format, zlib blocks
+wit XCONVERT   game.nkit.iso  game.iso
+wit VERIFY     game.iso
+```
 
 <dl>
 <dt>Note:</dt>
