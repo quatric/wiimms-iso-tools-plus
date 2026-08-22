@@ -471,6 +471,13 @@ enumError XExtractNDS ( ccp source, ccp dest )
 
     //--- file system
 
+    // Keep the XEXTRACT layout valid even for cartridges with an empty FAT.
+    // XCREATE always scans data/ as the file-system root.
+    PathCatPP(buf,sizeof(buf),dest,NDS_DIR_DATA);
+    err = CreatePath(buf,true);
+    if (err)
+	goto abort;
+
     {
 	const u32 fnt_off  = le32(image+NDS_OFF_FNT_ROM);
 	const u32 fnt_size = le32(image+NDS_OFF_FNT_SIZE);
@@ -498,11 +505,8 @@ enumError XExtractNDS ( ccp source, ccp dest )
 	    if (err)
 		goto abort;
 
-	    PathCatPP(buf,sizeof(buf),dest,NDS_DIR_DATA);
-	    err = CreatePath(buf,true);
-	    if (!err)
-		err = extract_dir(dest,NDS_DIR_DATA,image,size,
-			fnt_off,fnt_size,fat_off,n_files,0xf000,0);
+	    err = extract_dir(dest,NDS_DIR_DATA,image,size,
+		    fnt_off,fnt_size,fat_off,n_files,0xf000,0);
 	    if (err)
 		goto abort;
 	}
